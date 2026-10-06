@@ -1,0 +1,10 @@
+# 备份与运行时产物：绝不入库（backups/ 里是真实的会话日志与投影缓存副本）
+backups/
+verify_root/
+out_*.txt
+*.log
+
+# 依赖与系统垃圾
+node_modules/
+.DS_Store
+Thumbs.db

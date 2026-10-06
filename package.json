@@ -1,0 +1,39 @@
+{
+  "name": "dsh-subagent-clean",
+  "version": "1.0.0",
+  "description": "Remove subagent entries from DeepSeek Harness session logs without breaking the log, delete orphaned projection caches, and purge whole sessions — always dry-run first, always with a backup.",
+  "type": "module",
+  "bin": {
+    "dsh-subagent-clean": "clean.mjs"
+  },
+  "files": [
+    "clean.mjs",
+    "verify_loader.mjs",
+    "clean.cmd",
+    "clean.sh",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "selftest": "node test/selftest.mjs",
+    "help": "node clean.mjs --help"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "session",
+    "subagent",
+    "projection-cache",
+    "cleanup",
+    "cli"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/<your-name>/dsh-subagent-clean.git"
+  }
+}
