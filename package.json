@@ -1,23 +1,46 @@
 {
-  "name": "dsh-subagent-clean",
-  "version": "1.0.0",
-  "description": "Remove subagent entries from DeepSeek Harness session logs without breaking the log, delete orphaned projection caches, and purge whole sessions — always dry-run first, always with a backup.",
+  "name": "dsh-agent-clean",
+  "version": "1.1.0",
+  "description": "Remove subagent entries from DeepSeek Harness session logs without breaking the log, delete orphaned projection caches, and purge whole sessions — a CLI (dry-run by default, always with a backup) plus an optional read-only DSH panel that shows what needs cleaning.",
   "type": "module",
   "bin": {
-    "dsh-subagent-clean": "clean.mjs"
+    "dsh-agent-clean": "clean.mjs"
+  },
+  "main": "./plugin/index.js",
+  "exports": {
+    ".": "./plugin/index.js",
+    "./client": "./plugin/client.js",
+    "./clean": "./clean.mjs",
+    "./package.json": "./package.json"
   },
   "files": [
     "clean.mjs",
     "verify_loader.mjs",
     "clean.cmd",
     "clean.sh",
+    "plugin",
+    "cordis.patch.yml",
+    "assets",
     "README.md",
     "README.zh.md",
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc.1"
   },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "platform": "web"
+    }
+  },
+  "icon": "./assets/icon.svg",
   "scripts": {
     "selftest": "node test/selftest.mjs",
     "help": "node clean.mjs --help"
@@ -25,20 +48,22 @@
   "keywords": [
     "deepseek-harness",
     "dsh",
+    "dsh-plugin",
     "session",
     "subagent",
     "projection-cache",
     "cleanup",
-    "cli"
+    "cli",
+    "gui"
   ],
   "author": "PolitaryMonicy",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/PolitaryMonicy/dsh-subagent-clean.git"
+    "url": "https://github.com/PolitaryMonicy/dsh-agent-clean.git"
   },
-  "homepage": "https://github.com/PolitaryMonicy/dsh-subagent-clean#readme",
+  "homepage": "https://github.com/PolitaryMonicy/dsh-agent-clean#readme",
   "bugs": {
-    "url": "https://github.com/PolitaryMonicy/dsh-subagent-clean/issues"
+    "url": "https://github.com/PolitaryMonicy/dsh-agent-clean/issues"
   }
 }

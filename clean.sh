@@ -1,6 +1,6 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# dsh-subagent-clean —— macOS / Linux 包装脚本
+# dsh-agent-clean —— macOS / Linux 包装脚本
 # 需要 Node.js >= 22（内置 zlib 的 zstd）。找不到时可用 DSH_NODE 指定 node。
 # 用法: ./clean.sh list | dismiss --session <id> [--apply] | purge ... | orphans | restore ...
 # ---------------------------------------------------------------------------

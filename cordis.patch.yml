@@ -1,0 +1,5 @@
+# dsh-agent-clean 的宿主半：只读诊断（面板用）
+# 卸载／禁用插件时，这一行会被 DSH 写进 profile 的 cordis.patch.yml 覆盖层。
+- insert:
+    - id: ui-agent-clean
+      name: dsh-agent-clean

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ---------------------------------------------------------------------------
-// dsh-subagent-clean 端到端自测（不碰你的真实 DSH_HOME）
+// dsh-agent-clean 端到端自测（不碰你的真实 DSH_HOME）
 //
 // 做法：在一个临时目录里造一个假的 DSH_HOME，写几份「像真的」的会话日志（zstd 帧 + JSON 行）
 // 与投影缓存，然后真的去跑 clean.mjs 的 list / orphans / purge / restore / dismiss，
@@ -59,6 +59,9 @@ const PROJ = '-C-Users-Test-selftest--';
 const A = 'session-aaaa1111-1111-1111-1111-111111111111'; // dismiss 目标
 const B = 'session-bbbb2222-2222-2222-2222-222222222222'; // 只留孤儿缓存
 const C = 'session-cccc3333-3333-3333-3333-333333333333'; // purge 目标
+// 子代理会话的目录名是**裸 uuid**（没有 `session-` 前缀）——曾经被孤儿判定漏掉，
+// 导致 orphans --apply 会删掉还活着的子代理会话的投影缓存（本用例是那次的回归测试）。
+const CHILD = 'dddd5555-5555-5555-5555-555555555555';
 
 fs.mkdirSync(CACHE, { recursive: true });
 const catRow = JSON.stringify({ seq: 2, type: 'subagent/catalog', ignorable: false, data: { childId: 'x1', label: 'demo child' } });
@@ -97,6 +100,10 @@ const logC4 = path.join(dirC, 'session.v4.jsonl.zstd');
 fs.writeFileSync(logC4, frame([metaRow, msgRow]));
 const cacheC = mkCache(C, '自测会话 C', null);
 const orphanPath = mkCache(B, '无目录的孤儿会话 B', [{ label: 'orphan child', childId: 'o1' }]);
+const dirChild = mkProject(CHILD);
+const logChild = path.join(dirChild, 'session.v4.jsonl.zstd');
+fs.writeFileSync(logChild, Buffer.concat([frame([headerRow(CHILD), metaRow, msgRow])]));
+const cacheChild = mkCache(CHILD, '子代理会话（目录名无 session- 前缀）', null);
 
 console.log(`临时 DSH_HOME: ${HOME}`);
 console.log(`（真实 DSH_HOME 与真实备份目录都不会被碰）\n`);
@@ -113,7 +120,7 @@ function run(args, extraEnv = {}) {
 console.log('1) list');
 let r = run(['list']);
 check('list 退出码 0', r.code === 0, `code=${r.code}`);
-check('list 认出 1 个含条目的会话', /共 2 个会话，其中 1 个含/.test(r.out), r.out.split('\n')[0]);
+check('list 认出 1 个含条目的会话', /共 3 个会话，其中 1 个含/.test(r.out), r.out.split('\n')[0]);
 check('list 显示日志中 2 条', /日志中 2 条/.test(r.out), r.out.match(/条目.*$/m)?.[0]);
 
 // ---- 2. orphans ------------------------------------------------------------
@@ -127,6 +134,7 @@ check('孤儿缓存已删除', !fs.existsSync(orphanPath));
 const orphanBak = fs.readdirSync(BACKUPS).map((n) => path.join(BACKUPS, n)).filter((p) => p.endsWith('_orphans'))[0];
 check('孤儿缓存有备份 + manifest', Boolean(orphanBak) && fs.existsSync(path.join(orphanBak, 'manifest.json')) && fs.existsSync(path.join(orphanBak, B + '.json')), String(orphanBak));
 check('有目录的缓存未被误删', fs.existsSync(cacheA) && fs.existsSync(cacheC));
+check('子代理会话（裸 uuid 目录）的缓存不算孤儿', fs.existsSync(cacheChild));
 
 // ---- 3. purge / restore ----------------------------------------------------
 console.log('\n3) purge / restore');

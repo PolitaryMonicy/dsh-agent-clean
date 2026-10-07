@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-subagent-clean —— 清理 DSH 里的子代理条目、会话与孤儿投影缓存（跨平台）
+ * dsh-agent-clean —— 清理 DSH 里的子代理条目、会话与孤儿投影缓存（跨平台）
  * Cross-platform cleaner for DSH subagent entries, sessions and orphan projection caches.
  *
  * 需求 / Requirements: Node.js >= 22（内置 zlib 的 zstd）。Windows / macOS / Linux 皆可。
@@ -42,17 +42,16 @@
  *
  * 输出同时写入 <状态目录>/out_last.txt（UTF-8），控制台乱码时读它。
  */
-import { readFileSync, writeFileSync, copyFileSync, mkdirSync, readdirSync, statSync, existsSync, rmSync, openSync, closeSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, mkdirSync, readdirSync, statSync, existsSync, rmSync, openSync, closeSync, realpathSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import zlib from 'node:zlib';
 
-if (typeof zlib.zstdCompressSync !== 'function' || typeof zlib.zstdDecompressSync !== 'function') {
-  process.stderr.write(`✗ 需要 Node.js >= 22（内置 zlib 的 zstd）；当前 ${process.version}\n`);
-  process.exit(1);
-}
+/** Node >= 22 才有 zlib 的 zstd。**不要**在模块顶层 exit：本文件会被 DSH 插件 import，
+ *  （顶层 exit 会把宿主进程一起带走）——只在「直接被 CLI 调用」时才退出。 */
+const HAS_ZSTD = typeof zlib.zstdCompressSync === 'function' && typeof zlib.zstdDecompressSync === 'function';
 
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
@@ -76,7 +75,7 @@ function writableDir(preferred, fallback) {
   return preferred;
 }
 /** 备份／输出／镜像自检的落点（包目录只读时退回 DSH_HOME）。 */
-const STATE_DIR = writableDir(TOOL_DIR, join(DSH_HOME, 'tools', 'dsh-subagent-clean'));
+const STATE_DIR = writableDir(TOOL_DIR, join(DSH_HOME, 'tools', 'dsh-agent-clean'));
 const BACKUP_ROOT = process.env.DSAC_BACKUP_DIR || join(STATE_DIR, 'backups');
 const MIRROR_ROOT = join(STATE_DIR, 'verify_root');
 const OUT_FILE = join(STATE_DIR, 'out_last.txt');
@@ -214,7 +213,7 @@ function listSessions(workspaceFilter) {
       out.push({
         project: project.name, projectLabel: decodeEscapes(project.name), sessionId: entry.name, dir, logPath,
         logName: logs[0].name, generation: logs[0].gen.version, size: st.size, mtime: st.mtime,
-        frames: info.frames, rows: info.rows, catalog: info.catalog,
+        frames: info.frames, rows: info.rows, catalog: info.catalog, broken: info.broken || '',
         cachePath: cache.exists ? cachePath : '', cache, allLogs: logs.map((l) => join(dir, l.name)),
       });
     }
@@ -603,9 +602,15 @@ function dismissOne(s, opts) {
 function allSessionIds() {
   const ids = new Set();
   if (!existsSync(SESS_ROOT)) return ids;
+  // 会话目录名有两种：根会话 `session-<uuid>`、子代理会话 `<uuid>`（**没有** session- 前缀）。
+  // 只认前一种会把「还活着的子代理会话」的投影缓存误判成孤儿缓存并被 orphans --apply 删掉。
+  const BARE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   for (const project of readdirSync(SESS_ROOT, { withFileTypes: true })) {
     if (!project.isDirectory()) continue;
-    for (const e of readdirSync(join(SESS_ROOT, project.name), { withFileTypes: true })) if (e.isDirectory() && e.name.startsWith('session-')) ids.add(e.name);
+    for (const e of readdirSync(join(SESS_ROOT, project.name), { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('session-') || BARE_UUID.test(e.name)) ids.add(e.name);
+    }
   }
   return ids;
 }
@@ -724,7 +729,7 @@ const command = (flag('--help') || flag('-h')) ? 'help'
   : (flag('--version') || flag('-V')) ? 'version'
     : (args.find((a) => !a.startsWith('-')) ?? 'list');
 function usage() {
-  say(`dsh-subagent-clean ${VERSION} —— DSH 子代理条目／会话／孤儿缓存清理（node ${process.version}，${process.platform}）`);
+  say(`dsh-agent-clean ${VERSION} —— DSH 子代理条目／会话／孤儿缓存清理（node ${process.version}，${process.platform}）`);
   say('');
   say('用法:');
   say(`  ${PROG} list [--workspace <片段>]                   查看各会话的子代理条目数`);
@@ -746,6 +751,23 @@ function usage() {
   say(`DSH_HOME=${DSH_HOME}`);
   say(`备份目录=${BACKUP_ROOT}`);
 }
+// ---------------------------------------------------------------- 供 GUI 插件（plugin/index.js）复用
+// 插件只读地用 listSessions / allSessionIds / readCache / inspect 做「诊断清单」，
+// 真正的写操作仍只走本文件的 CLI（必须完全退出 DSH）。
+export { DSH_HOME, SESS_ROOT, CACHE_ROOT, STATE_DIR, BACKUP_ROOT, VERSION, CATALOG_TYPE, DISMISS_TYPE };
+export { frameLength, frameTexts, inspect, readCache, listSessions, allSessionIds, emptyCatalogState, rebuildDismiss };
+
+/** 只有被 `node clean.mjs …`（或包装脚本）直接调用时才跑 CLI；被插件 import 时只导出、不执行。 */
+const INVOKED_DIRECTLY = (() => {
+  const arg = process.argv[1];
+  if (!arg) return false;
+  try { return realpathSync(arg) === realpathSync(fileURLToPath(import.meta.url)); } catch { return false; }
+})();
+if (INVOKED_DIRECTLY) {
+if (!HAS_ZSTD) {
+  process.stderr.write(`✗ 需要 Node.js >= 22（内置 zlib 的 zstd）；当前 ${process.version}\n`);
+  process.exit(1);
+}
 try {
   const common = { workspace: opt('--workspace'), app: opt('--app'), asar: opt('--asar'), modules: opt('--modules'), noVerify: flag('--no-verify'), noApp: flag('--no-app') };
   if (command === 'list') cmdList(opt('--workspace'));
@@ -754,7 +776,7 @@ try {
   else if (command === 'orphans') cmdOrphans({ apply: flag('--apply') });
   else if (command === 'strip') cmdStrip({ all: flag('--all'), session: opt('--session'), apply: flag('--apply'), force: flag('--force'), generations: opt('--generations') ?? 'newest' });
   else if (command === 'restore') cmdRestore(opt('--backup'));
-  else if (command === 'version' || flag('--version') || flag('-V')) { say(`dsh-subagent-clean ${VERSION}  (node ${process.version}, ${process.platform})`); emit(); }
+  else if (command === 'version' || flag('--version') || flag('-V')) { say(`dsh-agent-clean ${VERSION}  (node ${process.version}, ${process.platform})`); emit(); }
   else {
     usage();
     emit();
@@ -765,3 +787,4 @@ try {
   emit();
   process.exitCode = 1;
 }
+}  // if (INVOKED_DIRECTLY)

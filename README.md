@@ -1,6 +1,6 @@
-# dsh-subagent-clean
+# dsh-agent-clean
 
-[![Release](https://img.shields.io/github/v/release/PolitaryMonicy/dsh-subagent-clean?sort=semver&label=release)](https://github.com/PolitaryMonicy/dsh-subagent-clean/releases)
+[![Release](https://img.shields.io/github/v/release/PolitaryMonicy/dsh-agent-clean?sort=semver&label=release)](https://github.com/PolitaryMonicy/dsh-agent-clean/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org/)
 
@@ -43,8 +43,8 @@ $DSH_HOME/storages/session_projcache/sessions/<session-id>.json                 
 ## 2. Get the code, install & run
 
 ```bash
-git clone https://github.com/PolitaryMonicy/dsh-subagent-clean.git
-cd dsh-subagent-clean
+git clone https://github.com/PolitaryMonicy/dsh-agent-clean.git
+cd dsh-agent-clean
 ```
 
 (or click **Code → Download ZIP** on the GitHub page and unpack it.) No `npm install` needed — there are no

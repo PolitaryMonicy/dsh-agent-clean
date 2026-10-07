@@ -1,6 +1,6 @@
 @echo off
 rem ---------------------------------------------------------------------------
-rem dsh-subagent-clean -- Windows wrapper
+rem dsh-agent-clean -- Windows wrapper
 rem Needs Node.js >= 22 (built-in zlib zstd). Set DSH_NODE to a node.exe path.
 rem Usage: clean.cmd list  /  dismiss --session <id> [--apply]  /  purge ...
 rem        clean.cmd orphans  /  restore --backup <dir>  /  help
