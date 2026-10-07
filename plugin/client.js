@@ -15,7 +15,11 @@
  * 故此处照抄 `dsh-sidebar-qa/src/client/settings-slot.ts:50-77` 的做法：监听
  * `internal/service`（`ReflectService.notify` 每次 `provide` 都会发）＋先探测一次。
  *
- * 面板只读：真正的清理必须完全退出 DSH 后由 CLI 执行（见 plugin/index.js 顶部说明）。
+ * 面板做两件事：①只读地列出会话/子代理条目/孤儿投影缓存，并给出可复制的 CLI 命令；
+ * ②一个开关（默认启用）——打开后宿主半会在每次启动时架设一个**脱离的助手进程**，
+ * 等 DSH 完全退出后自动跑 `dismiss --all --apply` 的同一条管线（见 plugin/index.js）。
+ * 开关本身写在插件自己的 `auto-arm.json` 里，**运行中绝不动会话存储**：真正的清理必须
+ * 完全退出 DSH 后由 CLI 执行（理由见 plugin/index.js 顶部说明）。
  */
 /**
  * 宿主把 `window.__ModuleLoader__` 定义好的时机不一定早于本文件求值，所以带重试；
@@ -41,6 +45,8 @@ function registerWithLoader() {
 
     /** 宿主半注册的只读路由。 */
     const SCAN_ROUTE = '/plugins/dsh-agent-clean/scan'
+    /** 宿主半注册的开关路由（GET 读、POST 写）。 */
+    const SETTINGS_ROUTE = '/plugins/dsh-agent-clean/settings'
     /** 设置页座位的 id（DSH 也用它挑导航图标；不认识的 id 回落到齿轮，正合设置页）。 */
     const SETTINGS_ID = 'agent-clean'
     /** 排在 DSH 官方各节之后：general 0 / models 10 / plugins 15 / agent-presets 20 / archived-sessions 25 / sidebar-qa 30。 */
@@ -166,6 +172,38 @@ function registerWithLoader() {
       return [state, load]
     }
 
+    /** 写开关：POST 一个很小的 JSON，拿回新状态（失败时**必须**看出是 404 还是别的）。 */
+    function postSettings(patch) {
+      return fetch(SETTINGS_ROUTE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify(patch),
+      }).then(async (res) => {
+        const text = await res.text()
+        let payload
+        try { payload = text ? JSON.parse(text) : undefined } catch { payload = undefined }
+        if (!res.ok || payload === undefined || payload.ok !== true) {
+          const snippet = text ? text.slice(0, 160).replace(/\s+/g, ' ') : '(空响应体)'
+          throw new Error(`宿主返回 HTTP ${res.status}：${snippet}`)
+        }
+        return payload.value
+      })
+    }
+
+    /** 「上次自动清理」的一句话说明。 */
+    function describeAuto(report) {
+      if (!report) return '还没有自动清理的记录（助手只在你完全退出 DSH 之后动手）。'
+      const why = {
+        timeout: '等待 DSH 退出超时，未做任何改动',
+        'other-dsh-running': '检测到另一个 DSH 实例仍在运行，本次跳过',
+      }[report.why] || report.why || '未执行'
+      if (report.ran !== true) return `上次未执行：${why}（${report.at || '时间未知'}）`
+      const backups = Array.isArray(report.backups) ? report.backups.length : 0
+      return `上次自动清理：${report.at}，处理 ${report.sessions ?? '?'} 个会话，改写 ${report.cleaned ?? '?'} 个，`
+        + `失败 ${report.failures ?? '?'} 个${backups ? `，备份 ${backups} 份` : ''}`
+    }
+
     function CommandLine({ label, command, hint }) {
       return h('div', { style: { marginTop: '5px' } },
         h('div', { style: S.row },
@@ -230,11 +268,33 @@ function registerWithLoader() {
 
     function Panel({ embedded, onClose }) {
       const [state, load] = useScan()
+      const [busy, setBusy] = useState(false)
+      const [note, setNote] = useState('')
       useEffect(() => { load() }, [load])
       const value = state.value
       const cli = (value && value.cliPath) || 'clean.cmd'
       const orphanCount = (value && value.orphanCaches && value.orphanCaches.length) || 0
       const box = embedded ? { ...S.panel, ...S.panelEmbedded } : S.panel
+      const auto = (value && value.auto) || null
+      const autoOn = auto ? auto.settings?.enabled !== false : true
+      const autoSaved = Boolean(auto && auto.explicit)
+
+      const toggleAuto = (next) => {
+        setBusy(true)
+        setNote('')
+        postSettings({ enabled: next })
+          .then(() => {
+            setBusy(false)
+            setNote(next
+              ? '已启用：本次启动的助手已经架设好，完全退出 DSH 后自动清理，下次启动时生效。'
+              : '已关闭：正在等待的助手会自己读到关闭状态并原样退出。')
+            load()
+          })
+          .catch((error) => {
+            setBusy(false)
+            setNote('写入失败：' + String((error && error.message) || error))
+          })
+      }
 
       return h('div', { style: box },
         h('div', { style: S.row },
@@ -264,15 +324,56 @@ function registerWithLoader() {
               value.truncated ? '　（已截断显示 300 个）' : '',
             ),
 
+            h('div', { style: S.card },
+              h('div', { style: S.row },
+                h('label', {
+                  style: { display: 'flex', alignItems: 'center', gap: '7px', cursor: busy ? 'default' : 'pointer' },
+                },
+                  h('input', {
+                    type: 'checkbox',
+                    checked: autoOn,
+                    disabled: busy,
+                    onChange: (e) => toggleAuto(e.target.checked),
+                  }),
+                  h('span', { style: { fontWeight: 600 } }, '每次退出 DSH 时自动移除无用子代理条目'),
+                ),
+                h('span', { style: S.muted }, busy ? '写入中…' : autoSaved ? '已保存' : '默认启用'),
+              ),
+              h('div', { style: { ...S.muted, marginTop: '4px', fontSize: '11.5px' } },
+                '打开后，DSH 每次启动都会架设一个脱离的助手进程：它等你**完全退出** DSH 之后，'
+                + '自动执行与下面那条「一键清掉所有会话的子代理条目」完全相同的管线（逐会话整份备份 → 结构自检 → 真实加载器复核）。'
+                + '所以你什么都不用敲，下次启动时界面里就已经没有条目了。',
+              ),
+              h('div', { style: { ...S.muted, marginTop: '3px', fontSize: '11.5px' } },
+                '若退出时还有第二个 DSH 实例在跑，助手会跳过本次（下一个退出窗口再来）；'
+                + '助手只在看到 DSH 进程真的消失后才动盘，动作等价于你自己敲那条命令。',
+              ),
+              h('div', { style: { marginTop: '4px', fontSize: '11.5px' } }, describeAuto(auto && auto.lastAuto)),
+              note ? h('div', { style: { marginTop: '3px', fontSize: '11.5px', color: note.indexOf('失败') === 0 ? '#d9534f' : 'GrayText' } }, note) : null,
+              auto && auto.armFile
+                ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11px' } }, `开关文件：${auto.armFile}`)
+                : null,
+            ),
+
             h('div', { style: S.note },
-              h('div', { style: { fontWeight: 600 } }, '这个面板不会改任何东西。'),
+              h('div', { style: { fontWeight: 600 } }, '这个面板不会在 DSH 运行中改动会话存储。'),
               h('div', { style: { ...S.muted, marginTop: '3px' } },
                 'DSH 的契约不允许在运行中改写已提交的事件（seq 必须稠密、单写者），投影缓存也没有失效 API。' +
                 '所以真正的清理必须**完全退出 DSH** 后执行下面的命令，再启动 DSH。',
               ),
               h('div', { style: { ...S.muted, marginTop: '3px' } },
+                '（上面那个开关只写插件自己的 auto-arm.json，也走同一条「退出后才动手」的路。）',
+              ),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
                 `命令走本插件自带的 CLI：${value.cliPath}（备份默认落在 ${value.backupRoot}，可用 DSAC_BACKUP_DIR 改）。`,
               ),
+              h(CommandLine, {
+                label: `一键清掉所有会话的子代理条目（当前 ${value.withEntries} 个会话有条目）`,
+                command: `"${cli}" dismiss --all --apply`,
+                hint: '非破坏：保留全部行与 seq，只把「自己的」catalog 行改成被忽略的类型；每个会话都会先整份备份、'
+                  + '并用真实加载器在镜像里自检（会话多时会慢一些）。默认试演 —— 去掉 --apply 只看计划。'
+                  + '必须在完全退出 DSH 后执行，执行完再启动 DSH。',
+              }),
               h(CommandLine, { label: '一键清掉所有孤儿投影缓存（低风险）', command: `"${cli}" orphans --apply` }),
               h(CommandLine, { label: '先看总览（不改任何东西）', command: `"${cli}" list` }),
             ),

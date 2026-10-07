@@ -15,8 +15,9 @@ Zero dependencies: Node.js built-ins only (`node:zlib` zstd, `node:fs`, `node:ch
 > **Two halves — use either one.** The **CLI** is standalone: it works on DSH's files on disk, you run it yourself
 > from a terminal, outside DSH, and nothing has to be installed — get it with `git clone` (section 2) or
 > **Code → Download ZIP** on the GitHub page. The same package also ships an **optional DSH plugin half**: a host
-> route plus a read-only page under **Settings → Session cleanup** that shows what needs cleaning and hands you the
-> exact commands (section 2.1). Installing it is optional; the CLI is unaffected. Plugin marketplaces list *npm*
+> route plus a page under **Settings → Session cleanup** that shows what needs cleaning, hands you the exact
+> commands, and carries a switch (**on by default**) that runs the non-destructive cleanup for you on the next
+> quit (section 2.2). Installing it is optional; the CLI is unaffected. Plugin marketplaces list *npm*
 > packages that declare the `dsh` field, so this package can appear there once it is published to npm.
 
 - Never deletes a log line, never renumbers `seq` (v4 requires dense seq; deleting a line makes the whole session fail with `format v4 event N is not dense`)
@@ -82,17 +83,44 @@ dsh plugin --profile desktop add github:PolitaryMonicy/dsh-agent-clean    # stra
 dsh plugin --profile desktop add /path/to/this/repo                       # local checkout
 ```
 
-Then **quit DSH completely and start it again**. A read-only page appears at **Settings → 会话清理诊断 /
+Then **quit DSH completely and start it again**. A page appears at **Settings → 会话清理诊断 /
 Session cleanup** (the floating 🧹 button older builds had is gone).
 
-The plugin itself never writes anything: DSH's persistence contract forbids rewriting committed events while the
-app runs, and the projection cache has no invalidation API. The page scans `$DSH_HOME` (the same code as
-`list` + `orphans`), shows per-session subagent-entry counts, log sizes, cache titles and orphaned caches, and
-gives you copy-ready `dismiss` / `purge` / `orphans` commands to run **with DSH closed**. If the page reports
+The page scans `$DSH_HOME` (the same code as `list` + `orphans`), shows per-session subagent-entry counts, log
+sizes, cache titles and orphaned caches, and gives you copy-ready `dismiss` / `purge` / `orphans` commands —
+including **one that clears the subagent entries of every session at once**. If the page reports
 `宿主返回 HTTP 404`, the host half did not load — check `dsh --profile desktop --dump-config` for the entry and
 `%TEMP%\dsh-agent-clean-host.log` for the reason.
 
+The page also carries a switch (see 2.2). Neither the page nor the switch ever touches session storage while DSH
+is running: DSH's persistence contract forbids rewriting committed events (`seq` must stay dense, single writer)
+and the projection cache has no invalidation API, so even a successful in-process write would leave the old value
+in memory. Everything that changes a session happens **after DSH has exited**, through the same `clean.mjs`
+pipeline you would run by hand (per-session full backup → structural self-check → real-loader verification).
+
 To remove it: `dsh plugin --profile desktop remove dsh-agent-clean`.
+
+### 2.2 Auto-clean on quit (on by default)
+
+Because you have to restart DSH anyway for a cleaned session to look clean, the plugin can do the cleanup in that
+restart window for you. With the switch on (the default), each DSH boot:
+
+1. writes the switch to `auto-arm.json` in the package's state directory, and
+2. spawns a **detached helper** (`clean.mjs autowait --pid <the DSH process>`), which survives DSH's exit and
+   waits for that pid to disappear.
+
+Once DSH is really gone, the helper runs the same pipeline as `dismiss --all --apply` — full backup per session,
+structural self-check, verification with the real loader — over every session that has subagent entries, and
+writes `auto-report.json` (`auto.log` keeps a short history). You see the outcome in the page the next time you
+start DSH. Turning the switch off needs no restart: a helper that is still waiting re-reads the switch, sees
+`enabled: false`, and exits without touching anything. If a second DSH instance is still running at that moment,
+the helper skips this window and tries the next one.
+
+This is why the switch lives in the package's own state file rather than in DSH's settings service: a detached
+helper cannot read another process's in-memory settings, and this plugin must stay importable with no dependencies
+(no `@deepseek-ai/schemastery`) so a local `link:` install keeps working.
+
+Prefer to do it yourself? Turn the switch off and use the commands in the page — they are identical.
 
 ## 3. Commands
 
@@ -104,6 +132,7 @@ To remove it: `dsh plugin --profile desktop remove dsh-agent-clean`.
 | `purge --session <id\|prefix> [--apply]` | **Delete** the session directory + all generation logs + projection cache (full backup first) |
 | `orphans [--apply]` | List/delete projection caches whose session directory is gone |
 | `restore --backup <dir>` | Restore from a backup (works for dismiss / purge / orphans backups) |
+| `autowait --pid <DSH pid>` | Wait for that DSH process to exit, then dismiss every session that has subagent entries (what the plugin's switch arms at boot; obeys `auto-arm.json`) |
 | `version` / `help` | Version / help |
 
 **Common flags**
@@ -149,10 +178,26 @@ Two more constraints (handled by the tool):
 - Recompressed frames use `ZSTD_c_checksumFlag = 1`, matching the original format.
 - `orphans` only touches files under `storages/session_projcache/sessions/`.
 - `purge` backs up **all generation logs** (`session.v3/v4…`) plus the cache, then removes the session directory; `restore` recreates it.
+- The auto-clean helper (2.2) is **only ever armed, never in-process**: it waits for the DSH pid to disappear, takes a
+  pid-and-timestamp lock so two helpers cannot run at once, skips the window entirely if another DSH instance is
+  still running, and then goes through exactly the same backup → mirror self-check → real-loader verification path
+  as `dismiss --all --apply`. A switch turned off mid-session needs no kill: the waiting helper re-reads
+  `auto-arm.json` and exits untouched.
 
 ## 6. How correctness is proven
 
 - **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **32/32 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback); **35/35 pass** with a real-log fixture (section below).
+- **Offline probes** for the two plugin halves (no DSH, no writes to session storage):
+  - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS` — fakes `window.__ModuleLoader__` and a minimal React
+    to prove the settings slot is registered exactly once, that a late `slots` service is still picked up through
+    `internal/service` (idempotently), and that a host without `slots` does not throw.
+  - `npm run probe:host` → `VERDICT PASS` — drives the host half's two routes with fake requests: fence 403/405,
+    the `scan` payload shape, and every `POST /settings` branch (bad body, unknown field, off, on, no double-arm).
+    It backs up and restores `auto-arm.json` and arms the helper in dry-run mode (`DSAC_ARM_DRYRUN=1`), so no real
+    process is spawned and no cleanup runs.
+- **Auto-clean helper** exercised for real: `clean.mjs autowait` prints `开关关闭，未做任何改动。` when the switch is
+  off (exit 0) and writes `{"ran":false,"why":"timeout",…}` to `auto-report.json` when the waited pid never dies —
+  both without touching a session log.
 - **Byte-identical on a real log**: with a real session log (11,443 lines / 12,622,844 B),
   `node test/selftest.mjs --fixture <log> --expect-sha256 B51E6D96F3B4CF922282ECA1BBD11BE175EB9D64EAC676F37F746DAB619C3EBA`
   → the produced sha256 is **identical** to the manually validated fix.

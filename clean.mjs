@@ -21,6 +21,8 @@
  *   purge   --session <id|前缀> [--apply] [--force]  彻底删除会话目录 + 日志 + 投影缓存（先整份备份）
  *   orphans [--apply]                                列出／删除「没有会话目录」的孤儿投影缓存
  *   restore --backup <备份目录>                       从备份还原
+ *   autowait --pid <DSH 的 pid>                      等该进程退出后自动 dismiss --all（供插件在「重启窗口」调用，
+ *                                                    开关与状态见 <状态目录>/auto-arm.json、auto-report.json）
  *   help | version
  *
  * ⚠ 核心机制（务必先读 / read this first）
@@ -42,7 +44,7 @@
  *
  * 输出同时写入 <状态目录>/out_last.txt（UTF-8），控制台乱码时读它。
  */
-import { readFileSync, writeFileSync, copyFileSync, mkdirSync, readdirSync, statSync, existsSync, rmSync, openSync, closeSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, copyFileSync, mkdirSync, readdirSync, statSync, existsSync, rmSync, openSync, closeSync, realpathSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -224,9 +226,10 @@ function listSessions(workspaceFilter) {
 // ---------------------------------------------------------------- 输出
 const BUFFER = [];
 function say(line = '') { BUFFER.push(line); }
+let OUT_TARGET = OUT_FILE;
 function emit() {
   const text = BUFFER.join('\n') + '\n';
-  try { writeFileSync(OUT_FILE, text, 'utf8'); } catch { /* 忽略 */ }
+  try { writeFileSync(OUT_TARGET, text, 'utf8'); } catch { /* 忽略 */ }
   process.stdout.write(text);
 }
 function fmtTime(d) {
@@ -721,6 +724,163 @@ function cmdRestore(backupDir) {
   emit();
 }
 
+// ---------------------------------------------------------------- 自动清理（重启窗口）
+/**
+ * 由插件在 DSH 启动时「架设」：开关写进 <状态目录>/auto-arm.json，再 spawn 一个脱离的助手
+ * 进程 `clean.mjs autowait --pid <DSH 的 pid>`。助手等那个 pid 消失（＝DSH 已完全退出）之后
+ * 才动盘，走的仍是 dismiss --all 的同一条管线（整份备份 → 结构自检 → 真实加载器复核），
+ * 于是下一次启动时界面里已经没有条目了。
+ *
+ * 为什么必须等退出：DSH 不允许运行中改写已提交事件（seq 自 0 起稠密、单写者），投影缓存也没有
+ * 失效接口 —— 运行中写盘即便成功，进程内存里的旧值仍在（见 dismissOne 末尾的提示）。
+ */
+const ARM_FILE = join(STATE_DIR, 'auto-arm.json');
+const AUTO_REPORT = join(STATE_DIR, 'auto-report.json');
+const AUTO_LOG = join(STATE_DIR, 'auto.log');
+const AUTO_LOCK = join(STATE_DIR, 'auto.lock');
+const AUTO_DEFAULTS = { enabled: true, maxWaitMs: 12 * 60 * 60 * 1000, verify: true, checkOther: true };
+
+function readArm() {
+  try {
+    const raw = readFileSync(ARM_FILE, 'utf8').replace(/^\uFEFF/, '');
+    const j = JSON.parse(raw);
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : null;
+  } catch { return null; }
+}
+/** 合并写入架设文件（插件与 CLI 共用同一份形状）。 */
+function writeArm(patch) {
+  const next = { ...AUTO_DEFAULTS, ...(readArm() ?? {}), ...patch, updatedAt: new Date().toISOString() };
+  try {
+    mkdirSync(dirname(ARM_FILE), { recursive: true });
+    writeFileSync(ARM_FILE, JSON.stringify(next, null, 2) + '\n', 'utf8');
+  } catch { /* 盘不可写时保持默认行为，不抛 */ }
+  return next;
+}
+function readAutoReport() {
+  try {
+    const raw = readFileSync(AUTO_REPORT, 'utf8').replace(/^\uFEFF/, '');
+    const j = JSON.parse(raw);
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : null;
+  } catch { return null; }
+}
+function writeAutoReport(report) {
+  try {
+    mkdirSync(dirname(AUTO_REPORT), { recursive: true });
+    writeFileSync(AUTO_REPORT, JSON.stringify(report, null, 2) + '\n', 'utf8');
+  } catch { /* 忽略 */ }
+}
+function autoLog(line) {
+  try { appendFileSync(AUTO_LOG, `[${new Date().toISOString()}] ${line}\n`, 'utf8'); } catch { /* 忽略 */ }
+}
+function pidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try { process.kill(n, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+}
+/** 同步小睡（助手进程不需要事件循环）。 */
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+  catch { const end = Date.now() + ms; while (Date.now() < end) { /* 忙等兜底 */ } }
+}
+/** 另一个 DSH 实例仍在跑时不动盘：它可能正持有这些会话，而本进程窥探不到别家内存。 */
+function otherDshAlive() {
+  if (!IS_WIN) return false;
+  try {
+    const r = spawnSync('tasklist', ['/FI', 'IMAGENAME eq DeepSeek Harness.exe', '/FO', 'CSV', '/NH'], {
+      encoding: 'utf8', timeout: 10000, windowsHide: true,
+    });
+    return /deepseek harness\.exe/i.test(String(r.stdout ?? ''));
+  } catch { return false; }
+}
+/** 独占认领：同一次启动被重复架设、或多个实例并存时，只有一个助手动手。 */
+function claimLock() {
+  const now = Date.now();
+  try {
+    const j = JSON.parse(readFileSync(AUTO_LOCK, 'utf8'));
+    if (j && Number.isFinite(j.at) && now - j.at < 10 * 60 * 1000 && pidAlive(j.pid)) return false;
+  } catch { /* 无锁或读不出 → 可认领 */ }
+  try { writeFileSync(AUTO_LOCK, JSON.stringify({ pid: process.pid, at: now }) + '\n', 'utf8'); return true; } catch { return false; }
+}
+
+function cmdAutoWait(opts) {
+  const pid = Number(opts.pid);
+  const arm = readArm();
+  if (arm === null || arm.enabled !== true) {
+    autoLog(`自动清理：开关关闭（arm=${arm === null ? '缺失' : JSON.stringify({ enabled: arm.enabled })}），未做任何改动`);
+    say('自动清理：开关关闭，未做任何改动。');
+    emit();
+    return;
+  }
+  if (!Number.isInteger(pid) || pid <= 0) {
+    autoLog('自动清理：缺少有效的 --pid');
+    say('自动清理：需要有效的 --pid <DSH 进程号>。');
+    emit();
+    process.exitCode = 1;
+    return;
+  }
+  const maxWaitMs = Number.isFinite(Number(arm.maxWaitMs)) && Number(arm.maxWaitMs) > 0 ? Number(arm.maxWaitMs) : AUTO_DEFAULTS.maxWaitMs;
+  const t0 = Date.now();
+  autoLog(`自动清理：等 DSH pid=${pid} 退出（上限 ${Math.round(maxWaitMs / 60000)} 分钟）`);
+  while (pidAlive(pid)) {
+    if (Date.now() - t0 > maxWaitMs) {
+      autoLog('自动清理：等待超时（DSH 似乎仍在运行），退出');
+      writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'timeout', waitedPid: pid, waitedMs: Date.now() - t0 });
+      say('自动清理：等待 DSH 退出超时，未做任何改动。');
+      emit();
+      return;
+    }
+    sleepSync(2000);
+  }
+  if (!claimLock()) {
+    autoLog('自动清理：已有另一个助手在跑，退出');
+    say('自动清理：已有另一个助手在执行，退出。');
+    emit();
+    return;
+  }
+  if (arm.checkOther !== false && otherDshAlive()) {
+    autoLog('自动清理：检测到另一个 DSH 进程仍在运行，跳过（下次退出时再来）');
+    writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'other-dsh-running', waitedPid: pid });
+    say('自动清理：检测到另一个 DSH 实例仍在运行，本次跳过。');
+    emit();
+    return;
+  }
+  const startedAt = new Date();
+  const useOpts = {
+    workspace: undefined, all: true, apply: true, force: true,
+    noVerify: arm.verify === false,
+    app: opts.app, asar: opts.asar, modules: opts.modules, noApp: opts.noApp,
+  };
+  const all = listSessions();
+  const targets = all.filter((s) => s.catalog > 0 || (s.cache.catalogCount ?? 0) > 0);
+  say(`自动清理：DSH (pid ${pid}) 已退出，开始处理 ${targets.length} 个会话（${fmtTime(startedAt)}）`);
+  if (!targets.length) {
+    say('自动清理：没有需要处理的会话。');
+    writeAutoReport({ at: startedAt.toISOString(), ran: true, pid, sessions: 0, cleaned: 0, failures: 0, results: [], durationMs: Date.now() - t0 });
+    autoLog('自动清理：没有需要处理的会话');
+    emit();
+    return;
+  }
+  const app = findApp(useOpts);
+  const modules = findModules(useOpts);
+  say(`自动清理：真实加载器复核途径 ${app ? `可用（${app.asar}）` : modules ? `可用（${modules}）` : '不可用（未加 --no-verify 将拒绝写入）'}`);
+  const results = [];
+  for (const s of targets) {
+    const r = dismissOne(s, useOpts);
+    results.push({ sessionId: s.sessionId, ok: r.ok === true, changed: r.changed ?? 0, backup: r.backup ?? null });
+  }
+  const cleaned = results.filter((r) => r.changed > 0).length;
+  const failures = results.filter((r) => !r.ok).length;
+  writeAutoReport({
+    at: startedAt.toISOString(), ran: true, pid, verify: arm.verify !== false,
+    sessions: targets.length, cleaned, failures,
+    backups: results.map((r) => r.backup).filter(Boolean), results, durationMs: Date.now() - t0,
+  });
+  autoLog(`自动清理：完成，处理 ${targets.length}，改写 ${cleaned}，失败 ${failures}`);
+  say(`自动清理：处理 ${targets.length} 个；改写 ${cleaned} 个；失败 ${failures} 个。备份在 ${BACKUP_ROOT}`);
+  emit();
+  if (failures) process.exitCode = 1;
+}
+
 // ---------------------------------------------------------------- 入口
 const args = process.argv.slice(2);
 const flag = (n) => args.includes(n);
@@ -740,6 +900,7 @@ function usage() {
   say('                                                   彻底删除会话目录 + 全部日志 + 投影缓存（先整份备份）');
   say(`  ${PROG} orphans [--apply]                           列出／删除「没有会话目录」的孤儿投影缓存`);
   say(`  ${PROG} restore --backup <备份目录>                  从备份还原（dismiss／purge／orphans 的备份皆可）`);
+  say(`  ${PROG} autowait --pid <DSH 的 pid>                  等该进程退出后自动执行 dismiss --all（供插件调用）`);
   say(`  ${PROG} version | help`);
   say('');
   say('默认皆为「试演」，加 --apply 才真正写入；日志 5 分钟内被写过需 --force。');
@@ -756,6 +917,7 @@ function usage() {
 // 真正的写操作仍只走本文件的 CLI（必须完全退出 DSH）。
 export { DSH_HOME, SESS_ROOT, CACHE_ROOT, STATE_DIR, BACKUP_ROOT, VERSION, CATALOG_TYPE, DISMISS_TYPE };
 export { frameLength, frameTexts, inspect, readCache, listSessions, allSessionIds, emptyCatalogState, rebuildDismiss };
+export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, pidAlive, cmdAutoWait };
 
 /** 只有被 `node clean.mjs …`（或包装脚本）直接调用时才跑 CLI；被插件 import 时只导出、不执行。 */
 const INVOKED_DIRECTLY = (() => {
@@ -776,6 +938,7 @@ try {
   else if (command === 'orphans') cmdOrphans({ apply: flag('--apply') });
   else if (command === 'strip') cmdStrip({ all: flag('--all'), session: opt('--session'), apply: flag('--apply'), force: flag('--force'), generations: opt('--generations') ?? 'newest' });
   else if (command === 'restore') cmdRestore(opt('--backup'));
+  else if (command === 'autowait') cmdAutoWait({ pid: opt('--pid'), app: opt('--app'), asar: opt('--asar'), modules: opt('--modules'), noApp: flag('--no-app') });
   else if (command === 'version' || flag('--version') || flag('-V')) { say(`dsh-agent-clean ${VERSION}  (node ${process.version}, ${process.platform})`); emit(); }
   else {
     usage();

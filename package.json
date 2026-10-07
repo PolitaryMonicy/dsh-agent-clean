@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-clean",
-  "version": "1.2.0",
-  "description": "Remove subagent entries from DeepSeek Harness session logs without breaking the log, delete orphaned projection caches, and purge whole sessions — a CLI (dry-run by default, always with a backup) plus an optional read-only DSH settings page (Settings → Session cleanup) that shows what needs cleaning.",
+  "version": "1.3.0",
+  "description": "Remove subagent entries from DeepSeek Harness session logs without breaking the log, delete orphaned projection caches, and purge whole sessions — a CLI (dry-run by default, always with a backup) plus an optional DSH settings page (Settings → Session cleanup) that shows what needs cleaning and can clean everything automatically on the next quit.",
   "type": "module",
   "bin": {
     "dsh-agent-clean": "clean.mjs"
@@ -45,7 +45,8 @@
   "scripts": {
     "selftest": "node test/selftest.mjs",
     "probe:client": "node test/client-slot-probe.mjs",
-    "prepublishOnly": "npm run selftest",
+    "probe:host": "node test/host-routes-probe.mjs",
+    "prepublishOnly": "npm run selftest && npm run probe:client && npm run probe:host",
     "help": "node clean.mjs --help"
   },
   "keywords": [

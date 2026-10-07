@@ -1,30 +1,43 @@
 /**
- * dsh-agent-clean —— DSH 宿主半（只读诊断）
+ * dsh-agent-clean —— DSH 宿主半（诊断 + 自动清理的「架设」端）
  *
- * 这个半只做一件事：把 CLI 的**只读**扫描（会话、子代理条目数、孤儿投影缓存）
- * 通过一条自带信任栅栏的 HTTP 路由暴露给客户端面板。
+ * 做三件事：
+ *  1. 把 CLI 的**只读**扫描（会话、子代理条目数、孤儿投影缓存）通过一条自带信任
+ *     栅栏的 HTTP 路由暴露给面板（`SCAN_ROUTE`）；
+ *  2. 读写开关（`SETTINGS_ROUTE`）：开关与上次自动清理的报告都存本包状态目录的
+ *     `auto-arm.json` / `auto-report.json`（CLI 与插件共用同一份形状）；
+ *  3. 开关打开时，启动期间**架设一个脱离的助手进程**（`clean.mjs autowait --pid <本进程>`）。
+ *     助手等本进程消失（＝DSH 已完全退出）之后才动盘，走的仍是 `dismiss --all` 的同一条
+ *     管线（逐会话整份备份 → 结构自检 → 真实加载器复核）。
  *
- * 为什么只读：DSH 的契约不允许在运行中改写已提交的事件（`dsh-session-persistence`
+ * 为什么清理必须等到退出：DSH 的契约不允许在运行中改写已提交的事件（`dsh-session-persistence`
  * README：「Committed events are never rewritten」，seq 必须自 0 起稠密、单写者），
  * 投影缓存也没有失效 API（`dsh-session-projection-cache`：「No eviction or retention
- * surface」，且该存储域被缓存自己 already-open）。所以真正的清理**始终**由
- * `clean.mjs` 在 DSH 完全退出后执行 —— 本插件只负责「让你看清该清什么」。
+ * surface」，且该存储域被缓存自己 already-open）。运行中即便写盘成功，宿主内存里的旧值仍在。
+ * ⇒ **本插件在运行中绝不碰会话存储**：它自己只写状态目录里的两个小 JSON，真正的改写
+ * 由退出后的助手完成（等同用户手敲 `clean.mjs dismiss --all --apply`）。
  *
  * 复用的是同一个包里的 `../clean.mjs`（已逐字节验证过的实现），不另写一套扫描逻辑。
  * clean.mjs 里有「直接被调用才跑 CLI」的守卫，import 它不会执行任何命令。
  */
+import { spawn } from 'node:child_process'
 import { appendFileSync, existsSync, readdirSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  ARM_FILE,
+  AUTO_DEFAULTS,
   CACHE_ROOT,
   DSH_HOME,
   SESS_ROOT,
   VERSION,
   allSessionIds,
   listSessions,
+  readArm,
+  readAutoReport,
   readCache,
+  writeArm,
 } from '../clean.mjs'
 
 /** cordis 插件名（`cordis.patch.yml` 里写的 `name` 是**包名**，两者可以不同）。 */
@@ -36,6 +49,12 @@ export const inject = ['webServer']
 
 /** 客户端面板轮询的路径。 */
 export const SCAN_ROUTE = '/plugins/dsh-agent-clean/scan'
+
+/** 开关（自动清理）与「上次自动清理报告」的读写路径。 */
+export const SETTINGS_ROUTE = '/plugins/dsh-agent-clean/settings'
+
+/** POST 体上限（这里只可能收到 {"enabled":false} 这种小对象）。 */
+const BODY_LIMIT = 8192
 
 /** 一次回给面板的会话上限（超出时置 truncated，面板会提示收窄工作区）。 */
 const MAX_SESSIONS = 300
@@ -132,6 +151,96 @@ function makeFence(connection) {
   }
 }
 
+/**
+ * 读一个小的 JSON 请求体。解析不了（或超限）就回 undefined —— 调用方会回 400，
+ * 不做任何写操作。
+ */
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    const chunks = []
+    let size = 0
+    let done = false
+    const finish = (value) => {
+      if (done) return
+      done = true
+      resolve(value)
+    }
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > BODY_LIMIT) {
+        finish(undefined)
+        try { req.destroy() } catch { /* 忽略 */ }
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8')
+      if (!text.trim()) return finish({})
+      try { finish(JSON.parse(text)) } catch { finish(undefined) }
+    })
+    req.on('error', () => finish(undefined))
+  })
+}
+
+/**
+ * 开关现状 + 上次自动清理报告。开关默认**启用**（用户要求：人工清理反正也要重启，
+ * 自动更省事），所以 arm 文件还没生成时按默认值显示。
+ */
+function autoState() {
+  const stored = readArm()
+  return {
+    settings: stored ?? AUTO_DEFAULTS,
+    explicit: stored !== null,
+    armFile: ARM_FILE,
+    lastAuto: readAutoReport(),
+  }
+}
+
+/** 同一个宿主进程只架设一个助手（面板反复开关也不会叠出第二个）。 */
+let helperArmed = false
+
+/**
+ * 架设脱离的助手：`clean.mjs autowait --pid <本进程>`。
+ *
+ * - `detached` + `stdio:'ignore'` + `unref()` ⇒ 助手不随 DSH 退出而消失，也不占管道；
+ * - `ELECTRON_RUN_AS_NODE=1` **必须设**：宿主里 `process.execPath` 是 Electron 可执行文件，
+ *   不设这个变量就会另开一个 GUI 实例（而不是跑 Node 脚本）；
+ * - 助手只在 `auto-arm.json` 的 `enabled === true` 时才真正动手，所以「关掉开关」不需要
+ *   去杀任何进程：已在等待的助手醒来后会自己读到关闭状态并原样退出。
+ */
+function armHelper(reason) {
+  if (helperArmed) return false
+  const arm = readArm() ?? writeArm({})
+  if (arm.enabled !== true) return false
+  // 离线探针用的开关：只登记状态、不真的开进程（否则测试跑完会留下一个真在等 pid 的助手）。
+  if (process.env.DSAC_ARM_DRYRUN === '1') {
+    helperArmed = true
+    return true
+  }
+  try {
+    const child = spawn(process.execPath, [join(PKG_ROOT, 'clean.mjs'), 'autowait', '--pid', String(process.pid)], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    })
+    // 没有这个监听器，ENOENT（clean.mjs 不在）会变成**未捕获异常**，把宿主进程带下去。
+    child.on('error', (error) => {
+      helperArmed = false
+      trace(`auto-clean helper spawn error: ${String(error)}`)
+    })
+    child.unref()
+    helperArmed = true
+    console.info(`[dsh-agent-clean] auto-clean helper armed for pid ${process.pid} (${reason})`)
+    trace(`auto-clean helper armed for pid ${process.pid} (${reason})`)
+    return true
+  } catch (error) {
+    trace(`auto-clean helper failed to arm (${reason}): ${String(error)}`)
+    return false
+  }
+}
+
 /** 「目录已被删、投影缓存还在」的残骸：`session_projcache/sessions/*.json` 里没有会话目录的那些。 */
 function orphanCaches() {
   const known = new Set(allSessionIds())
@@ -200,11 +309,12 @@ export function scan() {
     truncated: sessions.length > MAX_SESSIONS,
     sessions: sessions.slice(0, MAX_SESSIONS),
     orphanCaches: orphanCaches(),
+    auto: autoState(),
   }
 }
 
 /**
- * 插件体。`apply` 只注册路由，不做任何写操作。
+ * 插件体。`apply` 注册两条路由，并按开关架设退出后的自动清理助手；**不碰会话存储**。
  * @param ctx - cordis 上下文（至少含 `webServer`）。
  */
 export function apply(ctx) {
@@ -215,15 +325,20 @@ export function apply(ctx) {
     const connection = readConnection(ctx)
     const isTrustedRequest = makeFence(connection)
 
-    const handler = (req, res) => {
+    const guard = (req, res) => {
       if (!isTrustedRequest(req)) {
         sendJson(res, 403, { ok: false, error: { code: 'forbidden', message: '请求未通过同源校验。' } })
-        return
+        return false
       }
       if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'POST') {
-        sendJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: '只允许 GET／HEAD。' } })
-        return
+        sendJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: '只允许 GET／HEAD／POST。' } })
+        return false
       }
+      return true
+    }
+
+    const scanHandler = (req, res) => {
+      if (!guard(req, res)) return
       try {
         sendJson(res, 200, { ok: true, value: scan() })
       } catch (error) {
@@ -234,14 +349,54 @@ export function apply(ctx) {
       }
     }
 
-    const register = () => ctx.webServer.register({ kind: 'exact', path: SCAN_ROUTE, handler })
+    const settingsHandler = async (req, res) => {
+      if (!guard(req, res)) return
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 200, { ok: true, value: autoState() })
+          return
+        }
+        const body = await readJsonBody(req)
+        if (body === undefined || body === null || typeof body !== 'object' || Array.isArray(body)) {
+          sendJson(res, 400, { ok: false, error: { code: 'bad-body', message: '请求体必须是 JSON 对象。' } })
+          return
+        }
+        const patch = {}
+        if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
+        if (typeof body.verify === 'boolean') patch.verify = body.verify
+        if (Number.isFinite(Number(body.maxWaitMs)) && Number(body.maxWaitMs) > 0) patch.maxWaitMs = Number(body.maxWaitMs)
+        if (Object.keys(patch).length === 0) {
+          sendJson(res, 400, {
+            ok: false,
+            error: { code: 'no-known-field', message: '没有可写的字段（只接受 enabled / verify / maxWaitMs）。' },
+          })
+          return
+        }
+        const next = writeArm(patch)
+        // 打开时立刻为**本次**启动架设助手；关掉时什么都不用做（已在等待的助手会自己读到关闭状态）。
+        const armed = next.enabled === true ? armHelper('settings update') : false
+        sendJson(res, 200, { ok: true, value: { ...autoState(), armed: helperArmed, justArmed: armed } })
+      } catch (error) {
+        sendJson(res, 500, {
+          ok: false,
+          error: { code: 'settings-failed', message: String((error && error.message) || error) },
+        })
+      }
+    }
+
+    const register = () => {
+      ctx.webServer.register({ kind: 'exact', path: SCAN_ROUTE, handler: scanHandler })
+      ctx.webServer.register({ kind: 'exact', path: SETTINGS_ROUTE, handler: settingsHandler })
+    }
     // 照 dsh-chat-manager 的做法：用 ctx.effect 注册（延迟、带标签、随 fiber 释放）。
     if (typeof ctx.effect === 'function') {
-      ctx.effect(register, 'dsh-agent-clean: read-only diagnostic route')
+      ctx.effect(register, 'dsh-agent-clean: diagnostic + settings routes')
     } else {
       register()
     }
-    console.info(`[dsh-agent-clean] route ready: ${SCAN_ROUTE} (fence: ${connection === undefined ? 'same-origin fallback' : 'connection.requestRejection'})`)
+    // 开关默认启用 ⇒ 每次启动都架设一次「退出后自动清理」。
+    const armed = armHelper('apply')
+    console.info(`[dsh-agent-clean] routes ready: ${SCAN_ROUTE} + ${SETTINGS_ROUTE} (fence: ${connection === undefined ? 'same-origin fallback' : 'connection.requestRejection'}, auto-clean helper: ${armed ? 'armed' : helperArmed ? 'already armed' : 'off'})`)
   } catch (error) {
     // 绝不把异常抛回 Loader：那样整个宿主都可能被算作「entry did not activate」而且悄无声息。
     const detail = String((error && error.stack) || error)

@@ -13,9 +13,9 @@
 
 > **两半，任选其一。** **命令行**是独立的：它只对 DSH 的磁盘文件动手，由你在 DSH 之外用终端运行，
 > 什么都不用安装 —— `git clone`（第二节）或网页上的 **Code → Download ZIP** 即可。同一个包还带一个
-> **可选的 DSH 插件半**：一条宿主路由 ＋ 「**设置 → 会话清理诊断**」里的只读页面，告诉你该清什么、
-> 并把命令复制给你（见第 2.1 小节）。装不装都行，不影响命令行。插件市场收录的是**声明了 `dsh` 字段的
-> npm 包**，所以本包一旦发到 npm 就可能出现在那里。
+> **可选的 DSH 插件半**：一条宿主路由 ＋ 「**设置 → 会话清理诊断**」里的页面，告诉你该清什么、把命令复制给你，
+> 还带一个**默认启用**的开关：**下次退出 DSH 时自动把无用子代理条目清掉**（见第 2.2 小节）。装不装都行，
+> 不影响命令行。插件市场收录的是**声明了 `dsh` 字段的 npm 包**，所以本包一旦发到 npm 就可能出现在那里。
 
 - 不删任何日志行、不改 seq（v4 格式要求 seq 稠密，删行会让整个会话报 `format v4 event N is not dense`）
 - 只把「自己的」子代理目录行改成 `subagent/catalog-dismissed` + `ignorable: true`
@@ -77,15 +77,36 @@ dsh plugin --profile desktop add github:PolitaryMonicy/dsh-agent-clean    # 直�
 dsh plugin --profile desktop add /本仓库/路径                             # 本地检出
 ```
 
-装完**完全退出 DSH 再启动**。**设置 → 会话清理诊断**里会多出一个只读页面（旧版本右下角那个 🧹 浮标已删除）。
+装完**完全退出 DSH 再启动**。**设置 → 会话清理诊断**里会多出一个页面（旧版本右下角那个 🧹 浮标已删除）。
 
-插件本身什么都不改：DSH 的契约不允许在运行中改写已提交的事件，投影缓存也没有失效 API。这个页面扫描
-`$DSH_HOME`（跑的就是 `list` + `orphans` 同一份代码），列出每个会话的子代理条目数、日志大小、缓存标题，
-以及孤儿投影缓存，并把 `dismiss` / `purge` / `orphans` 命令复制给你 —— 请在**关掉 DSH** 之后执行。若页面报
-`宿主返回 HTTP 404`，说明宿主半没加载：用 `dsh --profile desktop --dump-config` 看组合树里有没有这个条目，
-再看 `%TEMP%\dsh-agent-clean-host.log` 里的原因。
+这个页面扫描 `$DSH_HOME`（跑的就是 `list` + `orphans` 同一份代码），列出每个会话的子代理条目数、日志大小、
+缓存标题，以及孤儿投影缓存，并把 `dismiss` / `purge` / `orphans` 命令复制给你 —— 其中包括**一条命令清掉所有会话
+的子代理条目**。若页面报 `宿主返回 HTTP 404`，说明宿主半没加载：用 `dsh --profile desktop --dump-config`
+看组合树里有没有这个条目，再看 `%TEMP%\dsh-agent-clean-host.log` 里的原因。
+
+页面还带一个开关（见 2.2）。**无论是页面还是开关，都不在 DSH 运行中碰会话存储**：DSH 的契约不允许运行中
+改写已提交事件（seq 必须稠密、单写者），投影缓存也没有失效 API，所以运行中即便写盘成功，进程内存里仍是旧值。
+**真正改动会话的动作一律发生在 DSH 退出之后**，走的就是你手敲 `clean.mjs` 的同一条管线（逐会话整份备份 →
+结构自检 → 真实加载器复核）。
 
 卸载：`dsh plugin --profile desktop remove dsh-agent-clean`。
+
+### 2.2 退出时自动清理（默认启用）
+
+既然清完也**必须重启 DSH** 才看得见效果，那干脆让插件在这个重启窗口里替你做掉。开关打开（默认）时，DSH 每次启动会：
+
+1. 把开关写进本包状态目录的 `auto-arm.json`；
+2. 启动一个**脱离的助手进程**（`clean.mjs autowait --pid <本次 DSH 进程>`）——它不随 DSH 退出而消失，只等那个 pid 消失。
+
+等 DSH 真的退出后，助手就跑与 `dismiss --all --apply` 完全相同的管线（每个会话先整份备份 → 结构自检 →
+真实加载器复核），处理所有还有子代理条目的会话，并把结果写进 `auto-report.json`（`auto.log` 留一小段历史）。
+下次启动 DSH 时你就能在页面上看到结果。关掉开关**不需要重启**：还在等的助手会重新读一遍开关，看到
+`enabled: false` 就原样退出；若那一刻还有第二个 DSH 实例在跑，助手会跳过本轮，等下一个退出窗口。
+
+开关为什么不放进 DSH 的 settings 服务：脱离的助手读不到另一个进程内存里的设置；而且本插件必须保持
+**零依赖**（不 import `@deepseek-ai/schemastery`）才能在本地 `link:` 安装下继续工作。
+
+想自己动手？把开关关掉，用页面里那几条命令 —— 它们做的事完全一样。
 
 ## 三、命令
 
@@ -97,6 +118,7 @@ dsh plugin --profile desktop add /本仓库/路径                             #
 | `purge --session <id\|前缀> [--apply]` | **彻底删除**会话目录 + 全部 generation 日志 + 投影缓存（先整份备份） |
 | `orphans [--apply]` | 列出／删除「会话目录已经不在、缓存还在」的孤儿缓存 |
 | `restore --backup <备份目录>` | 从备份还原（dismiss／purge／orphans 的备份都认） |
+| `autowait --pid <DSH 进程号>` | 等这个 DSH 进程退出，然后清掉所有还有子代理条目的会话（插件开关在启动时架设的就是它；它看 `auto-arm.json` 的脸色） |
 | `version` / `help` | 版本／帮助 |
 
 **公共开关**
@@ -142,10 +164,18 @@ DSH 客户端只读**投影缓存**里的 `projectionsBySession[].values.subagen
 - 重压日志帧时固定 `ZSTD_c_checksumFlag = 1`，与原格式一致。
 - `orphans` 只动 `storages/session_projcache/sessions/` 下的缓存文件，不碰会话目录。
 - `purge` 会备份**全部 generation 日志**（`session.v3/v4…`）与缓存，然后删除会话目录；`restore` 会重建目录。
+- 自动清理助手（2.2）**只被架设、绝不在本进程里动手**：它等 DSH 的 pid 消失，用「pid ＋ 时间戳」的锁保证同时只有一个
+  助手在跑，若那一刻还有另一个 DSH 实例在运行则整轮跳过，然后走与 `dismiss --all --apply` 一模一样的
+  备份 → 镜像自检 → 真实加载器复核流程。开关在会话中途关掉也不需要杀进程：还在等的助手会重读
+  `auto-arm.json` 后原样退出。
 
 ## 六、怎么证明它是对的
 
 - **自带回归测试**（不碰真实数据）：`node test/selftest.mjs` → **32/32 通过**（假 `DSH_HOME`，覆盖 list／orphans／purge+restore／dismiss 安全闸／离线变换／restore 回滚）；带真实日志 fixture 时 **35/35 通过**（见下条）。
+- **两半插件各自的离线探针**（不启动 DSH、不碰会话存储）：
+  - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS`：伪造 `window.__ModuleLoader__` 与极简 React，证明设置页座位只注册一次、`slots` 服务迟到时靠 `internal/service` 补挂且幂等、宿主没有 `slots` 时也不抛。
+  - `npm run probe:host` → `VERDICT PASS`：用假请求驱动宿主半的两条路由 —— 栅栏 403／405、`scan` 返回体形状、`POST /settings` 的全部分支（坏体、无可写字段、关、开、不重复架设）。它会先备份再还原 `auto-arm.json`，并以 `DSAC_ARM_DRYRUN=1` 干跑，**不开真进程、不跑任何清理**。
+- **自动清理助手实跑**：开关关闭时 `clean.mjs autowait` 打印「开关关闭，未做任何改动。」（exit 0）；被等的 pid 一直不消失时写出 `{"ran":false,"why":"timeout",…}` 到 `auto-report.json` —— 两次都没碰任何会话日志。
 - **真实日志逐字节一致**：用一份真实会话日志（11443 行 / 12,622,844 B）跑
   `node test/selftest.mjs --fixture <日志> --expect-sha256 B51E6D96F3B4CF922282ECA1BBD11BE175EB9D64EAC676F37F746DAB619C3EBA`
   → 产物 sha256 与人工验证过的修复结果**完全相同**。
