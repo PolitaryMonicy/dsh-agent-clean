@@ -19,7 +19,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLEAN = path.join(HERE, '..', 'clean.mjs');
@@ -188,6 +188,21 @@ r = run(['restore', '--backup', dismissBak]);
 check('restore 退出码 0', r.code === 0, `code=${r.code}`);
 check('日志回到逐字节相同', sha256(logA) === logAShaBefore, `${sha256(logA)} != ${logAShaBefore}`);
 check('缓存也回到原样（含 2 条）', JSON.parse(fs.readFileSync(cacheA, 'utf8')).record.rows.subagentCatalog.val.head.values.length === 2);
+
+// ---- 6b. 自动清理的「另一个 DSH 实例」判定 --------------------------------
+console.log('\n6b) otherDshPids（必须排除助手自己）');
+// 助手自己就是用 DSH 的 exe 跑的（ELECTRON_RUN_AS_NODE=1），镜像名与真 DSH 一样：
+// 不排除自己 → 永远判定「另一个实例在跑」→ 一次也不清理（1.3.0 的真实故障）。
+const pidProbe = spawnSync(process.execPath, ['--input-type=module', '-e', `
+const m = await import(process.env.DSAC_TEST_CLEAN);
+const ids = [process.pid, 1234, 4321, 5555];
+process.stdout.write(JSON.stringify({ kept: m.otherDshPids(1234, ids), onlySelf: m.otherDshPids(1234, [process.pid]) }));
+`], { encoding: 'utf8', env: { ...process.env, DSH_HOME: HOME, DSAC_TEST_CLEAN: pathToFileURL(CLEAN).href } });
+let pidJson = {};
+try { pidJson = JSON.parse(String(pidProbe.stdout || '').trim()); } catch { pidJson = {}; }
+check('otherDshPids 排除助手自己与被等的 pid',
+  JSON.stringify(pidJson.kept) === '[4321,5555]' && JSON.stringify(pidJson.onlySelf) === '[]',
+  `code=${pidProbe.status} out=${String(pidProbe.stdout || '').trim().slice(0, 120)} err=${String(pidProbe.stderr || '').trim().slice(0, 160)}`);
 
 // ---- 7. 可选：真实日志的 dismiss 回归 --------------------------------------
 if (FIXTURE) {

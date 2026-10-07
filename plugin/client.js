@@ -196,7 +196,9 @@ function registerWithLoader() {
       if (!report) return '还没有自动清理的记录（助手只在你完全退出 DSH 之后动手）。'
       const why = {
         timeout: '等待 DSH 退出超时，未做任何改动',
-        'other-dsh-running': '检测到另一个 DSH 实例仍在运行，本次跳过',
+        'other-dsh-running': (Array.isArray(report.otherPids) && report.otherPids.length
+          ? `检测到另一个 DSH 实例仍在运行（pid ${report.otherPids.join('、')}），本次跳过`
+          : '检测到另一个 DSH 实例仍在运行，本次跳过'),
       }[report.why] || report.why || '未执行'
       if (report.ran !== true) return `上次未执行：${why}（${report.at || '时间未知'}）`
       const backups = Array.isArray(report.backups) ? report.backups.length : 0

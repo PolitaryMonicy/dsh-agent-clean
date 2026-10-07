@@ -782,15 +782,33 @@ function sleepSync(ms) {
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
   catch { const end = Date.now() + ms; while (Date.now() < end) { /* 忙等兜底 */ } }
 }
-/** 另一个 DSH 实例仍在跑时不动盘：它可能正持有这些会话，而本进程窥探不到别家内存。 */
-function otherDshAlive() {
-  if (!IS_WIN) return false;
+/** 当前所有 DSH 进程的 pid（Windows 按镜像名；含本助手自己 —— 调用方必须自己排除）。 */
+function dshProcessIds() {
+  if (!IS_WIN) return [];
   try {
     const r = spawnSync('tasklist', ['/FI', 'IMAGENAME eq DeepSeek Harness.exe', '/FO', 'CSV', '/NH'], {
       encoding: 'utf8', timeout: 10000, windowsHide: true,
     });
-    return /deepseek harness\.exe/i.test(String(r.stdout ?? ''));
-  } catch { return false; }
+    const ids = [];
+    for (const line of String(r.stdout ?? '').split(/\r?\n/)) {
+      const m = /^"[^"]*","(\d+)"/.exec(line);
+      if (m) ids.push(Number(m[1]));
+    }
+    return ids;
+  } catch { return []; }
+}
+/**
+ * 除本助手与被等的那个 pid 之外，还有哪些 DSH 进程。
+ * **必须排除 process.pid**：助手自己就是用 DSH 的 exe 跑的（ELECTRON_RUN_AS_NODE=1），
+ * 镜像名同样是「DeepSeek Harness.exe」—— 不排除自己就会永远判定「另一个实例在跑」，
+ * 于是一次也不会执行（1.3.0 的实际故障就是这样：用户关掉 DSH 后助手仍看见自己）。
+ * 主进程刚退出时它的 GPU/渲染子进程可能还残留一两秒，调用方用宽限重试处理，不在此处等待。
+ */
+function otherDshPids(waitedPid, ids = dshProcessIds()) {
+  const skip = new Set([process.pid]);
+  const waited = Number(waitedPid);
+  if (Number.isInteger(waited) && waited > 0) skip.add(waited);
+  return ids.map(Number).filter((id) => Number.isInteger(id) && id > 0 && !skip.has(id));
 }
 /** 独占认领：同一次启动被重复架设、或多个实例并存时，只有一个助手动手。 */
 function claimLock() {
@@ -837,12 +855,21 @@ function cmdAutoWait(opts) {
     emit();
     return;
   }
-  if (arm.checkOther !== false && otherDshAlive()) {
-    autoLog('自动清理：检测到另一个 DSH 进程仍在运行，跳过（下次退出时再来）');
-    writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'other-dsh-running', waitedPid: pid });
-    say('自动清理：检测到另一个 DSH 实例仍在运行，本次跳过。');
-    emit();
-    return;
+  if (arm.checkOther !== false) {
+    // 主进程刚退出时，它的 GPU/渲染子进程可能还残留一两秒 —— 宽限重判，别把这种残留当成「另一个实例」。
+    let others = otherDshPids(pid);
+    for (let i = 0; i < 10 && others.length; i++) {
+      autoLog(`自动清理：另见 DSH 进程 ${others.join(',')}，1 秒后重判（${i + 1}/10）`);
+      sleepSync(1000);
+      others = otherDshPids(pid);
+    }
+    if (others.length) {
+      autoLog(`自动清理：检测到另一个 DSH 实例仍在运行（pid ${others.join(',')}），跳过（下次退出时再来）`);
+      writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'other-dsh-running', waitedPid: pid, otherPids: others });
+      say(`自动清理：检测到另一个 DSH 实例仍在运行（pid ${others.join(',')}），本次跳过。`);
+      emit();
+      return;
+    }
   }
   const startedAt = new Date();
   const useOpts = {
@@ -918,6 +945,7 @@ function usage() {
 export { DSH_HOME, SESS_ROOT, CACHE_ROOT, STATE_DIR, BACKUP_ROOT, VERSION, CATALOG_TYPE, DISMISS_TYPE };
 export { frameLength, frameTexts, inspect, readCache, listSessions, allSessionIds, emptyCatalogState, rebuildDismiss };
 export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, pidAlive, cmdAutoWait };
+export { dshProcessIds, otherDshPids };
 
 /** 只有被 `node clean.mjs …`（或包装脚本）直接调用时才跑 CLI；被插件 import 时只导出、不执行。 */
 const INVOKED_DIRECTLY = (() => {
