@@ -11,9 +11,11 @@
 > 这个工具产生于一次真实事故：一个会话的子代理（subagent）入口卡住／损坏，删不掉。经反查
 > DSH 的会话日志格式与加载器源码，找到了**不破坏日志**的正确改法，做成命令行工具并附完整回归测试。
 
-> **这不是一个 DSH 插件。** 它是对 DSH 磁盘文件动手的独立命令行工具，由你在 DSH 之外用终端自行运行；
-> 因此它**不会**出现在插件市场或「添加插件」对话框里（那套机制只认 DSH 插件包）。获取方式见第二节
-> —— `git clone`，或在网页上点 **Code → Download ZIP**。
+> **两半，任选其一。** **命令行**是独立的：它只对 DSH 的磁盘文件动手，由你在 DSH 之外用终端运行，
+> 什么都不用安装 —— `git clone`（第二节）或网页上的 **Code → Download ZIP** 即可。同一个包还带一个
+> **可选的 DSH 插件半**：一条宿主路由 ＋ 「**设置 → 会话清理诊断**」里的只读页面，告诉你该清什么、
+> 并把命令复制给你（见第 2.1 小节）。装不装都行，不影响命令行。插件市场收录的是**声明了 `dsh` 字段的
+> npm 包**，所以本包一旦发到 npm 就可能出现在那里。
 
 - 不删任何日志行、不改 seq（v4 格式要求 seq 稠密，删行会让整个会话报 `format v4 event N is not dense`）
 - 只把「自己的」子代理目录行改成 `subagent/catalog-dismissed` + `ignorable: true`
@@ -64,6 +66,26 @@ node clean.mjs list
 ```
 
 包装脚本会自己找 Node：`%DSH_NODE%` / `$DSH_NODE` → PATH 上的 `node` → 常见安装路径。
+
+### 2.1 可选：DSH 插件半
+
+同一个包也是一个 DSH 插件（声明了 `dsh.bundle.patch` 与 `dsh.client`），所以桌面版的插件管理器能装它：
+
+```bash
+dsh plugin --profile desktop add dsh-agent-clean                          # 从 npm
+dsh plugin --profile desktop add github:PolitaryMonicy/dsh-agent-clean    # 直接从 GitHub
+dsh plugin --profile desktop add /本仓库/路径                             # 本地检出
+```
+
+装完**完全退出 DSH 再启动**。**设置 → 会话清理诊断**里会多出一个只读页面（旧版本右下角那个 🧹 浮标已删除）。
+
+插件本身什么都不改：DSH 的契约不允许在运行中改写已提交的事件，投影缓存也没有失效 API。这个页面扫描
+`$DSH_HOME`（跑的就是 `list` + `orphans` 同一份代码），列出每个会话的子代理条目数、日志大小、缓存标题，
+以及孤儿投影缓存，并把 `dismiss` / `purge` / `orphans` 命令复制给你 —— 请在**关掉 DSH** 之后执行。若页面报
+`宿主返回 HTTP 404`，说明宿主半没加载：用 `dsh --profile desktop --dump-config` 看组合树里有没有这个条目，
+再看 `%TEMP%\dsh-agent-clean-host.log` 里的原因。
+
+卸载：`dsh plugin --profile desktop remove dsh-agent-clean`。
 
 ## 三、命令
 
@@ -123,7 +145,7 @@ DSH 客户端只读**投影缓存**里的 `projectionsBySession[].values.subagen
 
 ## 六、怎么证明它是对的
 
-- **自带回归测试**（不碰真实数据）：`node test/selftest.mjs` → **34/34 通过**（假 `DSH_HOME`，覆盖 list／orphans／purge+restore／dismiss 安全闸／离线变换／restore 回滚）。
+- **自带回归测试**（不碰真实数据）：`node test/selftest.mjs` → **32/32 通过**（假 `DSH_HOME`，覆盖 list／orphans／purge+restore／dismiss 安全闸／离线变换／restore 回滚）；带真实日志 fixture 时 **35/35 通过**（见下条）。
 - **真实日志逐字节一致**：用一份真实会话日志（11443 行 / 12,622,844 B）跑
   `node test/selftest.mjs --fixture <日志> --expect-sha256 B51E6D96F3B4CF922282ECA1BBD11BE175EB9D64EAC676F37F746DAB619C3EBA`
   → 产物 sha256 与人工验证过的修复结果**完全相同**。

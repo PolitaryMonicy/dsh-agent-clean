@@ -1,13 +1,19 @@
 /**
- * dsh-agent-clean —— DSH 客户端半（只读诊断面板）
+ * dsh-agent-clean —— DSH 客户端半（只读诊断页）
  *
  * 手写的 lazy-CJS 构件（与 `dsh-sidebar-qa` 的 `lib/client.js` 同一形态）：
  * 页面加载时调用 `window.__ModuleLoader__.load({id, factory})`，由宿主把模块表里的
- * `react` / `react-dom/client` 交给 factory。**没有构建步骤**——本文件就是产物。
+ * `react` 交给 factory。**没有构建步骤**——本文件就是产物。
  *
- * 为什么不用 slot：现有子代理界面没有任何「条目级」扩展位（`conversation.session.header.actions`
- * 只有官方那一个 `subagent-catalog` 格子），覆盖它属于 shadows-shipped-ui。这里改用
- * **自挂的浮标 + 自有面板**（right-bottom），对官方 UI 零改动、零 slot API 依赖。
+ * 入口：官方设置页座位 `settings.section`（「设置 → 会话清理诊断」）。以前自挂过一个
+ * 右下角浮标，但那会压住发送按钮、语义也不清（用户 m04458 提出），已删除。
+ *
+ * 两条等待是真的、且互相独立：`slots` 服务由 DSH 渲染层发布，座位 `settings.section`
+ * 由设置页声明。座位这一层交给 `slots.inject`（座位声明后回调才跑）；而 `slots` 本身
+ * **只能 `ctx.get` 探测**——写进 `inject` 会让本插件的 fiber 在没有渲染层的组合里被
+ * park，而 parked fiber 会让**整个 web boot 失败**（`boot-client.ts`），不是跳过本插件。
+ * 故此处照抄 `dsh-sidebar-qa/src/client/settings-slot.ts:50-77` 的做法：监听
+ * `internal/service`（`ReflectService.notify` 每次 `provide` 都会发）＋先探测一次。
  *
  * 面板只读：真正的清理必须完全退出 DSH 后由 CLI 执行（见 plugin/index.js 顶部说明）。
  */
@@ -30,25 +36,26 @@ function registerWithLoader() {
   id: 'dsh-agent-clean',
   factory: (require) => {
     const React = require('react')
-    const ReactDOM = require('react-dom/client')
     const h = React.createElement
     const { useCallback, useEffect, useState } = React
 
     /** 宿主半注册的只读路由。 */
     const SCAN_ROUTE = '/plugins/dsh-agent-clean/scan'
-    /** 自挂容器的 id（HMR 重复 apply 时先摘旧的，避免叠影）。 */
-    const HOST_ID = 'dsh-agent-clean-host'
+    /** 设置页座位的 id（DSH 也用它挑导航图标；不认识的 id 回落到齿轮，正合设置页）。 */
+    const SETTINGS_ID = 'agent-clean'
+    /** 排在 DSH 官方各节之后：general 0 / models 10 / plugins 15 / agent-presets 20 / archived-sessions 25 / sidebar-qa 30。 */
+    const SETTINGS_ORDER = 31
+    /** 导航标签（每次投影都会重读）。 */
+    const LABEL = (() => {
+      try {
+        return /^zh/i.test(String(navigator.language || '')) ? '会话清理诊断' : 'Session cleanup'
+      } catch {
+        return '会话清理诊断'
+      }
+    })()
 
     /** 颜色一律用 CSS 系统色，自动跟随 DSH 的亮/暗主题，不依赖宿主的变量名。 */
     const S = {
-      pill: {
-        position: 'fixed', right: '16px', bottom: '16px', zIndex: 2147483000,
-        display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 11px',
-        borderRadius: '999px', border: '1px solid color-mix(in srgb, CanvasText 25%, Canvas)',
-        background: 'Canvas', color: 'CanvasText', boxShadow: '0 6px 18px rgba(0,0,0,.28)',
-        font: '12px/1.4 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif',
-        cursor: 'pointer', userSelect: 'none',
-      },
       badge: {
         minWidth: '17px', height: '17px', padding: '0 5px', borderRadius: '999px',
         background: 'color-mix(in srgb, CanvasText 14%, Canvas)', fontSize: '11px',
@@ -60,6 +67,12 @@ function registerWithLoader() {
         borderRadius: '12px', border: '1px solid color-mix(in srgb, CanvasText 25%, Canvas)',
         background: 'Canvas', color: 'CanvasText', boxShadow: '0 16px 44px rgba(0,0,0,.34)',
         padding: '12px 14px', font: '12.5px/1.55 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif',
+      },
+      /** 放进设置页时不再自绘外框——容器已经给了标题与滚动。 */
+      panelEmbedded: {
+        position: 'static', right: 'auto', bottom: 'auto', width: '100%', maxWidth: '820px',
+        maxHeight: 'none', overflow: 'visible', border: 'none', boxShadow: 'none',
+        background: 'transparent', padding: '0',
       },
       row: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' },
       title: { fontSize: '13px', fontWeight: 600 },
@@ -215,19 +228,20 @@ function registerWithLoader() {
       )
     }
 
-    function Panel({ onClose }) {
+    function Panel({ embedded, onClose }) {
       const [state, load] = useScan()
       useEffect(() => { load() }, [load])
       const value = state.value
       const cli = (value && value.cliPath) || 'clean.cmd'
       const orphanCount = (value && value.orphanCaches && value.orphanCaches.length) || 0
+      const box = embedded ? { ...S.panel, ...S.panelEmbedded } : S.panel
 
-      return h('div', { style: S.panel },
+      return h('div', { style: box },
         h('div', { style: S.row },
-          h('div', { style: S.title }, 'dsh-agent-clean · 只读诊断'),
+          h('div', { style: S.title }, 'dsh-agent-clean · 会话清理诊断'),
           h('div', { style: { display: 'flex', gap: '6px' } },
             h('button', { style: S.btn, onClick: load }, state.phase === 'loading' ? '读取中…' : '刷新'),
-            h('button', { style: S.btn, onClick: onClose }, '关闭'),
+            embedded ? null : h('button', { style: S.btn, onClick: onClose }, '关闭'),
           ),
         ),
 
@@ -280,31 +294,15 @@ function registerWithLoader() {
                   h('div', { style: { ...S.muted, fontSize: '11.5px' } }, o.title || '（无标题）'),
                 )),
               )
-          : null,
-      )
+              : null,
+          )
           : null,
 
         state.phase === 'loading' && !value ? h('div', { style: { ...S.muted, marginTop: '8px' } }, '读取中…') : null,
       )
     }
 
-    function App() {
-      const [open, setOpen] = useState(false)
-      const [state, load] = useScan()
-      useEffect(() => { load() }, [load])
-      const value = state.value
-      const pending = value ? value.withEntries + ((value.orphanCaches && value.orphanCaches.length) || 0) : 0
-      return h(React.Fragment, null,
-        h('div', { style: S.pill, onClick: () => setOpen(!open), title: 'dsh-agent-clean：查看该清理什么（只读）' },
-          h('span', null, '🧹'),
-          h('span', null, '清理诊断'),
-          value ? h('span', { style: S.badge }, String(pending)) : null,
-        ),
-        open ? h(Panel, { onClose: () => setOpen(false) }) : null,
-      )
-    }
-
-    /** 面板崩溃会被 DSH 的 abdication 机制退掉注册，所以自套错误边界并给出重试。 */
+    /** 页面崩溃会被 DSH 的 abdication 机制退掉注册，所以自套错误边界并给出重试。 */
     class Boundary extends React.Component {
       constructor(props) {
         super(props)
@@ -318,7 +316,8 @@ function registerWithLoader() {
       }
       render() {
         if (this.state.error) {
-          return h('div', { style: { ...S.panel, color: '#d9534f' } },
+          const box = this.props.embedded ? { ...S.panel, ...S.panelEmbedded } : S.panel
+          return h('div', { style: { ...box, color: '#d9534f' } },
             '面板出错了：' + String((this.state.error && this.state.error.message) || this.state.error),
             h('div', { style: { marginTop: '8px' } },
               h('button', { style: S.btn, onClick: () => this.setState({ error: null }) }, '重试'),
@@ -330,32 +329,62 @@ function registerWithLoader() {
     }
 
     /**
-     * 客户端插件体：把浮标挂到 `document.body`（不占用任何 slot，故对官方 UI 零影响）。
-     * @param ctx - 客户端 cordis 上下文（这里不依赖任何服务）。
+     * slot 注册表：只探测，不注入（见文件头注释）。
+     * @param ctx - 客户端 cordis 上下文。
+     * @returns 服务面，或 undefined（渲染层还没组合进来）。
+     */
+    function slotsServiceOf(ctx) {
+      let slots
+      try { slots = ctx.get ? ctx.get('slots') : undefined } catch { return undefined }
+      if (slots === undefined || slots === null) return undefined
+      // inject 与 register 都会用到；只有其一＝组合有问题，宁可当「没有注册表」。
+      if (typeof slots.register !== 'function' || typeof slots.inject !== 'function') return undefined
+      return slots
+    }
+
+    /**
+     * 把只读诊断页挂进「设置 → 会话清理诊断」，一旦可能就挂（座位稍后声明也等得到）。
+     * @param ctx - 客户端 cordis 上下文。
+     */
+    function installSettingsSection(ctx) {
+      let installed = false
+
+      const installIfPossible = () => {
+        if (installed) return
+        const slots = slotsServiceOf(ctx)
+        if (slots === undefined) return
+        installed = true
+        const register = () => slots.inject('settings.section', () => slots.register({
+          name: 'settings.section',
+          id: SETTINGS_ID,
+          order: SETTINGS_ORDER,
+          label: () => LABEL,
+        }, () => h(Boundary, { embedded: true }, h(Panel, { embedded: true }))))
+        if (typeof ctx.effect === 'function') ctx.effect(register, 'dsh-agent-clean: settings section')
+        else register()
+        console.info('[dsh-agent-clean] settings section registered:', SETTINGS_ID)
+      }
+
+      const watch = () => {
+        // 任何服务发布都可能是我们等的渲染层（`internal/service` 由 ReflectService.notify 在每次 provide 时发出）。
+        let off
+        try { if (typeof ctx.on === 'function') off = ctx.on('internal/service', () => { installIfPossible() }) } catch { /* 忽略 */ }
+        // 常见情况是它已经组合好了，所以先探一次。
+        installIfPossible()
+        return off
+      }
+
+      if (typeof ctx.effect === 'function') ctx.effect(watch, 'dsh-agent-clean: settings slot watch')
+      else watch()
+    }
+
+    /**
+     * 客户端插件体：只占用官方设置页座位 `settings.section`，对官方 UI 其他部分零改动。
+     * @param ctx - 客户端 cordis 上下文。
      */
     function apply(ctx) {
       console.info('[dsh-agent-clean] client half applied')
-      const mount = () => {
-        const old = document.getElementById(HOST_ID)
-        if (old) old.remove()
-        const host = document.createElement('div')
-        host.id = HOST_ID
-        document.body.appendChild(host)
-        const root = ReactDOM.createRoot(host)
-        root.render(h(Boundary, null, h(App)))
-        return () => {
-          try { root.unmount() } catch { /* 忽略 */ }
-          host.remove()
-        }
-      }
-
-      let dispose
-      if (document.body) dispose = mount()
-      else window.addEventListener('DOMContentLoaded', () => { dispose = mount() }, { once: true })
-
-      if (typeof ctx?.effect === 'function') {
-        ctx.effect(() => () => { if (dispose) dispose() }, 'dsh-agent-clean: panel host')
-      }
+      installSettingsSection(ctx)
     }
 
     return { inject: [], apply }

@@ -12,9 +12,12 @@ Zero dependencies: Node.js built-ins only (`node:zlib` zstd, `node:fs`, `node:ch
 > After reverse-engineering DSH's session log format (v4) and its loader, the **non-destructive** fix was found,
 > wrapped into this CLI, and covered by a full regression suite.
 
-> **This is not a DSH plugin.** It is a standalone command-line tool that works on DSH's files on disk — you run it
-> yourself, from a terminal, outside DSH. It therefore never appears in any plugin marketplace or "add plugin"
-> dialog; get it with `git clone` (section 2) or **Code → Download ZIP** on the GitHub page.
+> **Two halves — use either one.** The **CLI** is standalone: it works on DSH's files on disk, you run it yourself
+> from a terminal, outside DSH, and nothing has to be installed — get it with `git clone` (section 2) or
+> **Code → Download ZIP** on the GitHub page. The same package also ships an **optional DSH plugin half**: a host
+> route plus a read-only page under **Settings → Session cleanup** that shows what needs cleaning and hands you the
+> exact commands (section 2.1). Installing it is optional; the CLI is unaffected. Plugin marketplaces list *npm*
+> packages that declare the `dsh` field, so this package can appear there once it is published to npm.
 
 - Never deletes a log line, never renumbers `seq` (v4 requires dense seq; deleting a line makes the whole session fail with `format v4 event N is not dense`)
 - Only retypes the session's **own** `subagent/catalog` rows to `subagent/catalog-dismissed` + `ignorable: true`
@@ -67,6 +70,29 @@ node clean.mjs list
 ```
 
 The wrappers locate Node themselves: `%DSH_NODE%` / `$DSH_NODE` → `node` on PATH → common install paths.
+
+### 2.1 Optional: the DSH plugin half
+
+The same package is a DSH plugin (it declares `dsh.bundle.patch` and `dsh.client`), so the Desktop app's plugin
+manager can install it:
+
+```bash
+dsh plugin --profile desktop add dsh-agent-clean                          # from npm
+dsh plugin --profile desktop add github:PolitaryMonicy/dsh-agent-clean    # straight from GitHub
+dsh plugin --profile desktop add /path/to/this/repo                       # local checkout
+```
+
+Then **quit DSH completely and start it again**. A read-only page appears at **Settings → 会话清理诊断 /
+Session cleanup** (the floating 🧹 button older builds had is gone).
+
+The plugin itself never writes anything: DSH's persistence contract forbids rewriting committed events while the
+app runs, and the projection cache has no invalidation API. The page scans `$DSH_HOME` (the same code as
+`list` + `orphans`), shows per-session subagent-entry counts, log sizes, cache titles and orphaned caches, and
+gives you copy-ready `dismiss` / `purge` / `orphans` commands to run **with DSH closed**. If the page reports
+`宿主返回 HTTP 404`, the host half did not load — check `dsh --profile desktop --dump-config` for the entry and
+`%TEMP%\dsh-agent-clean-host.log` for the reason.
+
+To remove it: `dsh plugin --profile desktop remove dsh-agent-clean`.
 
 ## 3. Commands
 
@@ -126,7 +152,7 @@ Two more constraints (handled by the tool):
 
 ## 6. How correctness is proven
 
-- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **34/34 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback).
+- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **32/32 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback); **35/35 pass** with a real-log fixture (section below).
 - **Byte-identical on a real log**: with a real session log (11,443 lines / 12,622,844 B),
   `node test/selftest.mjs --fixture <log> --expect-sha256 B51E6D96F3B4CF922282ECA1BBD11BE175EB9D64EAC676F37F746DAB619C3EBA`
   → the produced sha256 is **identical** to the manually validated fix.
