@@ -1,5 +1,9 @@
 # dsh-subagent-clean
 
+[![Release](https://img.shields.io/github/v/release/PolitaryMonicy/dsh-subagent-clean?sort=semver&label=release)](https://github.com/PolitaryMonicy/dsh-subagent-clean/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org/)
+
 **Cleanup tool for DSH (DeepSeek Harness) subagent entries, sessions and orphaned projection caches.**
 
 Zero dependencies: Node.js built-ins only (`node:zlib` zstd, `node:fs`, `node:child_process`).
@@ -7,6 +11,10 @@ Zero dependencies: Node.js built-ins only (`node:zlib` zstd, `node:fs`, `node:ch
 > Born out of a real incident: a session's subagent panel got stuck/desynced and the entries could not be removed.
 > After reverse-engineering DSH's session log format (v4) and its loader, the **non-destructive** fix was found,
 > wrapped into this CLI, and covered by a full regression suite.
+
+> **This is not a DSH plugin.** It is a standalone command-line tool that works on DSH's files on disk — you run it
+> yourself, from a terminal, outside DSH. It therefore never appears in any plugin marketplace or "add plugin"
+> dialog; get it with `git clone` (section 2) or **Code → Download ZIP** on the GitHub page.
 
 - Never deletes a log line, never renumbers `seq` (v4 requires dense seq; deleting a line makes the whole session fail with `format v4 event N is not dense`)
 - Only retypes the session's **own** `subagent/catalog` rows to `subagent/catalog-dismissed` + `ignorable: true`
@@ -32,9 +40,15 @@ $DSH_HOME/sessions/<escaped-workspace-name>/<session-id>/session.v4.jsonl.zstd  
 $DSH_HOME/storages/session_projcache/sessions/<session-id>.json                  ← projection cache (subagent entries live here)
 ```
 
-## 2. Install & run
+## 2. Get the code, install & run
 
-No `npm install` needed (no third-party modules). Pick one:
+```bash
+git clone https://github.com/PolitaryMonicy/dsh-subagent-clean.git
+cd dsh-subagent-clean
+```
+
+(or click **Code → Download ZIP** on the GitHub page and unpack it.) No `npm install` needed — there are no
+third-party modules. Pick one:
 
 ```bat
 :: Windows (double-click or run from a terminal)

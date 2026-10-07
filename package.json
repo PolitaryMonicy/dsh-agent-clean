@@ -31,9 +31,14 @@
     "cleanup",
     "cli"
   ],
+  "author": "PolitaryMonicy",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/<your-name>/dsh-subagent-clean.git"
+    "url": "https://github.com/PolitaryMonicy/dsh-subagent-clean.git"
+  },
+  "homepage": "https://github.com/PolitaryMonicy/dsh-subagent-clean#readme",
+  "bugs": {
+    "url": "https://github.com/PolitaryMonicy/dsh-subagent-clean/issues"
   }
 }

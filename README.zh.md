@@ -1,11 +1,19 @@
 # dsh-subagent-clean
 
+[![Release](https://img.shields.io/github/v/release/PolitaryMonicy/dsh-subagent-clean?sort=semver&label=release)](https://github.com/PolitaryMonicy/dsh-subagent-clean/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org/)
+
 **DSH（DeepSeek Harness）的子代理条目／会话／孤儿投影缓存清理工具。**
 
 零依赖：只用 Node.js 内置模块（`node:zlib` 的 zstd、`node:fs`、`node:child_process`）。
 
 > 这个工具产生于一次真实事故：一个会话的子代理（subagent）入口卡住／损坏，删不掉。经反查
 > DSH 的会话日志格式与加载器源码，找到了**不破坏日志**的正确改法，做成命令行工具并附完整回归测试。
+
+> **这不是一个 DSH 插件。** 它是对 DSH 磁盘文件动手的独立命令行工具，由你在 DSH 之外用终端自行运行；
+> 因此它**不会**出现在插件市场或「添加插件」对话框里（那套机制只认 DSH 插件包）。获取方式见第二节
+> —— `git clone`，或在网页上点 **Code → Download ZIP**。
 
 - 不删任何日志行、不改 seq（v4 格式要求 seq 稠密，删行会让整个会话报 `format v4 event N is not dense`）
 - 只把「自己的」子代理目录行改成 `subagent/catalog-dismissed` + `ignorable: true`
@@ -30,9 +38,14 @@ $DSH_HOME/sessions/<转义工作区名>/<session-id>/session.v4.jsonl.zstd   ←
 $DSH_HOME/storages/session_projcache/sessions/<session-id>.json        ← 投影缓存（子代理条目就在这里）
 ```
 
-## 二、安装与启动
+## 二、获取、安装与启动
 
-无需 `npm install`（没有任何第三方依赖）。三种启动方式，任选：
+```bash
+git clone https://github.com/PolitaryMonicy/dsh-subagent-clean.git
+cd dsh-subagent-clean
+```
+
+（也可在 GitHub 页面点 **Code → Download ZIP** 下载解压。）无需 `npm install`（没有任何第三方依赖）。三种启动方式，任选：
 
 ```bat
 :: Windows：把整个目录放到任意位置，双击或在终端里用
