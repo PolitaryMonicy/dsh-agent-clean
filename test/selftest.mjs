@@ -55,6 +55,9 @@ const HOME = path.join(tmp, 'home');
 const SESS = path.join(HOME, 'sessions');
 const CACHE = path.join(HOME, 'storages', 'session_projcache', 'sessions');
 const BACKUPS = path.join(tmp, 'backups');
+// 状态目录（auto-arm / auto-armed / auto.log / out_last 等）也隔离到临时目录：
+// 默认落点是**包目录**（TOOL_DIR），自测若不管就会往仓库根写文件。
+const STATE = path.join(tmp, 'state');
 const PROJ = '-C-Users-Test-selftest--';
 const A = 'session-aaaa1111-1111-1111-1111-111111111111'; // dismiss 目标
 const B = 'session-bbbb2222-2222-2222-2222-222222222222'; // 只留孤儿缓存
@@ -126,7 +129,7 @@ console.log(`（真实 DSH_HOME 与真实备份目录都不会被碰）\n`);
 function run(args, extraEnv = {}) {
   const r = spawnSync(process.execPath, [CLEAN, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, DSH_HOME: HOME, DSAC_BACKUP_DIR: BACKUPS, ...extraEnv },
+    env: { ...process.env, DSH_HOME: HOME, DSAC_BACKUP_DIR: BACKUPS, DSAC_STATE_DIR: STATE, ...extraEnv },
   });
   return { code: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
 }
@@ -212,7 +215,7 @@ const pidProbe = spawnSync(process.execPath, ['--input-type=module', '-e', `
 const m = await import(process.env.DSAC_TEST_CLEAN);
 const ids = [process.pid, 1234, 4321, 5555];
 process.stdout.write(JSON.stringify({ kept: m.otherDshPids(1234, ids), onlySelf: m.otherDshPids(1234, [process.pid]) }));
-`], { encoding: 'utf8', env: { ...process.env, DSH_HOME: HOME, DSAC_TEST_CLEAN: pathToFileURL(CLEAN).href } });
+`], { encoding: 'utf8', env: { ...process.env, DSH_HOME: HOME, DSAC_STATE_DIR: STATE, DSAC_TEST_CLEAN: pathToFileURL(CLEAN).href } });
 let pidJson = {};
 try { pidJson = JSON.parse(String(pidProbe.stdout || '').trim()); } catch { pidJson = {}; }
 check('otherDshPids 排除助手自己与被等的 pid',
@@ -237,6 +240,35 @@ check('自己那行改成了 dismissed + ignorable', ownIdx >= 0 && JSON.parse(i
 check('投影缓存写成带 fence 的空状态',
   JSON.stringify(JSON.parse(fs.readFileSync(cacheF, 'utf8')).record.rows.subagentCatalog.val) === `{"inheritedEventCount":${INHERITED}}`,
   JSON.stringify(JSON.parse(fs.readFileSync(cacheF, 'utf8')).record.rows.subagentCatalog.val));
+
+// ---- 6d. 上一轮架设的助手「没跑完就消失」必须能被看见 ----------------------
+console.log('\n6d) missedRun（静默失败不能静默）');
+// 实测教训：手动架设的助手会随宿主工具的进程树一起被杀 —— 退出窗口里什么都没发生，
+// 盘上也没有报告。宿主半启动时据此在设置页明说「上一轮没跑完」，而不是让用户干等。
+const armedFile = path.join(STATE, 'auto-armed.json');
+const reportFile = path.join(STATE, 'auto-report.json');
+fs.mkdirSync(STATE, { recursive: true });
+const DEAD_PID = 999999; // 系统里几乎不可能存在的 pid
+const OLD_AT = new Date(Date.now() - 3600 * 1000).toISOString();
+function missedProbe({ armed, report, currentPid }) {
+  fs.writeFileSync(armedFile, JSON.stringify(armed), 'utf8');
+  if (report) fs.writeFileSync(reportFile, JSON.stringify(report), 'utf8');
+  else fs.rmSync(reportFile, { force: true });
+  const p = spawnSync(process.execPath, ['--input-type=module', '-e', `
+const m = await import(process.env.DSAC_TEST_CLEAN);
+process.stdout.write(JSON.stringify({ missed: m.missedRun(Number(process.env.DSAC_CUR_PID)) }));
+`], { encoding: 'utf8', env: { ...process.env, DSH_HOME: HOME, DSAC_STATE_DIR: STATE, DSAC_CUR_PID: String(currentPid), DSAC_TEST_CLEAN: pathToFileURL(CLEAN).href } });
+  try { return JSON.parse(String(p.stdout || '').trim()).missed ?? null; } catch { return null; }
+}
+const armedDead = { waitedPid: 12345, helperPid: DEAD_PID, at: OLD_AT, version: 'test' };
+check('助手消失了且没有报告 → 报「上一轮没跑完」', missedProbe({ armed: armedDead, report: null, currentPid: 777 }) !== null);
+check('助手消失了但有更新的报告 → 不报（正常收尾）',
+  missedProbe({ armed: armedDead, report: { at: new Date().toISOString(), ran: true }, currentPid: 777 }) === null);
+check('记录的就是本轮（被等的 pid 是自己）→ 不报',
+  missedProbe({ armed: { ...armedDead, waitedPid: 777 }, report: null, currentPid: 777 }) === null);
+check('助手进程还活着 → 不报（它还在等）',
+  missedProbe({ armed: { ...armedDead, helperPid: process.pid }, report: null, currentPid: 777 }) === null);
+check('没有记录 → 不报', missedProbe({ armed: null, report: null, currentPid: 777 }) === null);
 
 // ---- 7. 可选：真实日志的 dismiss 回归 --------------------------------------
 if (FIXTURE) {

@@ -171,6 +171,10 @@ DSH 客户端只读**投影缓存**里的 `projectionsBySession[].values.subagen
   10 秒宽限），然后走与 `dismiss --all --apply` 一模一样的
   备份 → 镜像自检 → 真实加载器复核流程。开关在会话中途关掉也不需要杀进程：还在等的助手会重读
   `auto-arm.json` 后原样退出。
+- **静默失败必须能被看见**：宿主半每次架设助手都会把「谁在等谁」写进 `auto-armed.json`；下次启动时如果
+  发现那个助手已经不在了、却没有比架设时间更新的报告，设置页就会直接写明「上一次退出时自动清理没跑完」。
+  （实测教训：手动架设的助手会随宿主工具的进程树一起被杀 —— 退出窗口里什么都没发生，盘上也没有痕迹。）
+  每个终局都会留一份报告：成功、超时、另一个实例在跑、开关关闭、抢不到锁，所以这道判定不会误报。
 - **分叉会话（fork）**：这类日志前半段是父会话的**继承区**（`identity.inheritedEventCount`），里面可能也有父会话的
   `subagent/catalog` 行。它们不归本会话，清理时**逐字节保留**，自检也**不能**把它们算作「剩余 catalog」——
   否则只要日志里有继承来的 catalog 行就会恒判自检失败、一个分叉会话也清不掉。清理后投影缓存写成
@@ -178,7 +182,7 @@ DSH 客户端只读**投影缓存**里的 `projectionsBySession[].values.subagen
 
 ## 六、怎么证明它是对的
 
-- **自带回归测试**（不碰真实数据）：`node test/selftest.mjs` → **39/39 通过**（假 `DSH_HOME`，覆盖 list／orphans／purge+restore／dismiss 安全闸／离线变换／restore 回滚，自动清理的「是不是还有另一个 DSH 实例」判定——它**不能**把助手自己算进去，以及**分叉会话**：继承区里的 catalog 行必须逐字节保留、自己那几条必须改掉、缓存写成带 fence 的空状态）；带真实日志 fixture 时 **42/42 通过**（见下条）。
+- **自带回归测试**（不碰真实数据）：`node test/selftest.mjs` → **44/44 通过**（假 `DSH_HOME`，覆盖 list／orphans／purge+restore／dismiss 安全闸／离线变换／restore 回滚，自动清理的「是不是还有另一个 DSH 实例」判定——它**不能**把助手自己算进去，**分叉会话**：继承区里的 catalog 行必须逐字节保留、自己那几条必须改掉、缓存写成带 fence 的空状态，以及「上一轮助手没跑完就不能静默」的判定）；带真实日志 fixture 时 **47/47 通过**（见下条）。
 - **两半插件各自的离线探针**（不启动 DSH、不碰会话存储）：
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS`：伪造 `window.__ModuleLoader__` 与极简 React，证明设置页座位只注册一次、`slots` 服务迟到时靠 `internal/service` 补挂且幂等、宿主没有 `slots` 时也不抛。
   - `npm run probe:host` → `VERDICT PASS`：用假请求驱动宿主半的两条路由 —— 栅栏 403／405、`scan` 返回体形状、`POST /settings` 的全部分支（坏体、无可写字段、关、开、不重复架设）。它会先备份再还原 `auto-arm.json`，并以 `DSAC_ARM_DRYRUN=1` 干跑，**不开真进程、不跑任何清理**。

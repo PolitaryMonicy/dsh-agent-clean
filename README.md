@@ -185,6 +185,12 @@ Two more constraints (handled by the tool):
   always excluded from that check**; leftover GPU/renderer children get a 10-second grace), and then goes through exactly the same backup → mirror self-check → real-loader verification path
   as `dismiss --all --apply`. A switch turned off mid-session needs no kill: the waiting helper re-reads
   `auto-arm.json` and exits untouched.
+- **A silent no-show must be visible**: every time the host half arms the helper it records what is waiting for what in
+  `auto-armed.json`. On the next start, if that helper is gone and no report is newer than the arming record, the
+  settings page says so outright ("last exit's auto-clean did not finish"). (Measured lesson: a helper armed by a
+  host tool dies with that tool's process tree — nothing happens in the exit window and nothing is left on disk.)
+  Every terminal path writes a report — success, timeout, another instance running, switch off, lock busy — so this
+  check cannot false-alarm.
 - **Forked sessions**: the first part of such a log is the parent's **inherited region**
   (`identity.inheritedEventCount`) and may contain the parent's own `subagent/catalog` rows. Those rows do not belong
   to this session: they are kept **byte-for-byte**, and the self-check must **not** count them as "remaining
@@ -194,7 +200,7 @@ Two more constraints (handled by the tool):
 
 ## 6. How correctness is proven
 
-- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **39/39 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself, and a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence); **42/42 pass** with a real-log fixture (section below).
+- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **44/44 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself, a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, and the "a helper that never finished must not stay silent" check); **47/47 pass** with a real-log fixture (section below).
 - **Offline probes** for the two plugin halves (no DSH, no writes to session storage):
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS` — fakes `window.__ModuleLoader__` and a minimal React
     to prove the settings slot is registered exactly once, that a late `slots` service is still picked up through

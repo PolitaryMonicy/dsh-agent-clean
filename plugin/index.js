@@ -27,6 +27,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   ARM_FILE,
+  AUTO_ARMED,
   AUTO_DEFAULTS,
   CACHE_ROOT,
   DSH_HOME,
@@ -34,10 +35,12 @@ import {
   VERSION,
   allSessionIds,
   listSessions,
+  missedRun,
   readArm,
   readAutoReport,
   readCache,
   writeArm,
+  writeArmed,
 } from '../clean.mjs'
 
 /** cordis 插件名（`cordis.patch.yml` 里写的 `name` 是**包名**，两者可以不同）。 */
@@ -184,6 +187,13 @@ function readJsonBody(req) {
 }
 
 /**
+ * 启动瞬间先看一眼上一轮：上次架设的助手有没有收尾（被系统/工具一起杀掉的话，
+ * 退出窗口里什么都不会发生，盘上也没有报告 —— 那就是静默失败，必须在设置页说明）。
+ * **必须在架设本轮助手之前算**：架设会覆盖 auto-armed.json，把记录换成本轮。
+ */
+const startMissed = missedRun(process.pid)
+
+/**
  * 开关现状 + 上次自动清理报告。开关默认**启用**（用户要求：人工清理反正也要重启，
  * 自动更省事），所以 arm 文件还没生成时按默认值显示。
  */
@@ -193,7 +203,9 @@ function autoState() {
     settings: stored ?? AUTO_DEFAULTS,
     explicit: stored !== null,
     armFile: ARM_FILE,
+    armedFile: AUTO_ARMED,
     lastAuto: readAutoReport(),
+    lastMissed: startMissed,
   }
 }
 
@@ -231,6 +243,8 @@ function armHelper(reason) {
       trace(`auto-clean helper spawn error: ${String(error)}`)
     })
     child.unref()
+    // 记下「本轮是谁在等谁」：助手若在退出窗口里被杀，下次启动就能据此提示「上一轮没跑完」。
+    writeArmed({ waitedPid: process.pid, helperPid: child.pid ?? null, at: new Date().toISOString(), version: VERSION })
     helperArmed = true
     console.info(`[dsh-agent-clean] auto-clean helper armed for pid ${process.pid} (${reason})`)
     trace(`auto-clean helper armed for pid ${process.pid} (${reason})`)

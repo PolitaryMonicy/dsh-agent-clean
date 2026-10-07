@@ -123,6 +123,8 @@ async function main() {
   check('scan 带 cliPath / backupRoot', typeof v.cliPath === 'string' && typeof v.backupRoot === 'string', v.cliPath)
   check('scan 能列出会话', Number.isInteger(v.total) && Array.isArray(v.sessions), `total=${v.total}`)
   check('auto.lastAuto 允许为 null', v.auto?.lastAuto === null || typeof v.auto?.lastAuto === 'object')
+  check('auto 带「上一轮有没有跑完」的判定位', 'lastMissed' in (v.auto ?? {}), JSON.stringify(v.auto?.lastMissed ?? null))
+  check('auto 带助手记录文件路径', typeof v.auto?.armedFile === 'string' && v.auto.armedFile.endsWith('auto-armed.json'), v.auto?.armedFile)
 
   // settings: GET
   const g = await call(settings.handler, { method: 'GET', headers: LOOPBACK })

@@ -76,8 +76,8 @@ function writableDir(preferred, fallback) {
   }
   return preferred;
 }
-/** 备份／输出／镜像自检的落点（包目录只读时退回 DSH_HOME）。 */
-const STATE_DIR = writableDir(TOOL_DIR, join(DSH_HOME, 'tools', 'dsh-agent-clean'));
+/** 备份／输出／镜像自检的落点（包目录只读时退回 DSH_HOME）。DSAC_STATE_DIR 可显式指定，自测用它隔离。 */
+const STATE_DIR = process.env.DSAC_STATE_DIR || writableDir(TOOL_DIR, join(DSH_HOME, 'tools', 'dsh-agent-clean'));
 const BACKUP_ROOT = process.env.DSAC_BACKUP_DIR || join(STATE_DIR, 'backups');
 const MIRROR_ROOT = join(STATE_DIR, 'verify_root');
 const OUT_FILE = join(STATE_DIR, 'out_last.txt');
@@ -747,6 +747,13 @@ const ARM_FILE = join(STATE_DIR, 'auto-arm.json');
 const AUTO_REPORT = join(STATE_DIR, 'auto-report.json');
 const AUTO_LOG = join(STATE_DIR, 'auto.log');
 const AUTO_LOCK = join(STATE_DIR, 'auto.lock');
+/**
+ * 宿主半每次架设助手时写的记录（谁在等哪个 pid、助手进程号）。用途只有一个：
+ * 下一次启动时判断「上一轮架设的助手有没有收尾」——助手若被系统或别的工具一起杀掉，
+ * 退出窗口里就什么都不会发生，而盘上一点痕迹也没有（实测：手动架设的助手会随宿主工具的
+ * 进程树一起消失）。有这份记录，宿主半就能在设置页明说「上一轮没跑完」，而不是静默。
+ */
+const AUTO_ARMED = join(STATE_DIR, 'auto-armed.json');
 const AUTO_DEFAULTS = { enabled: true, maxWaitMs: 12 * 60 * 60 * 1000, verify: true, checkOther: true };
 
 function readArm() {
@@ -780,6 +787,35 @@ function writeAutoReport(report) {
 }
 function autoLog(line) {
   try { appendFileSync(AUTO_LOG, `[${new Date().toISOString()}] ${line}\n`, 'utf8'); } catch { /* 忽略 */ }
+}
+function readArmed() {
+  try {
+    const raw = readFileSync(AUTO_ARMED, 'utf8').replace(/^\uFEFF/, '');
+    const j = JSON.parse(raw);
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : null;
+  } catch { return null; }
+}
+function writeArmed(rec) {
+  try {
+    mkdirSync(dirname(AUTO_ARMED), { recursive: true });
+    writeFileSync(AUTO_ARMED, JSON.stringify(rec, null, 2) + '\n', 'utf8');
+  } catch { /* 忽略 */ }
+}
+/**
+ * 上一轮架设的助手是不是「没跑完就没了」——宿主半启动时用它给用户一句明确的提示。
+ * 三个条件同时成立才算：记录的不是本轮（被等的 pid 与当前进程不同）、那个助手进程已经不在、
+ * 而且报告没有比架设时间更新（＝它连 timeout / 跳过 这样的报告都没留下，是真的一声不响消失了）。
+ * 正常收尾的助手一定会写一份报告（成功、超时、跳过、开关关闭、抢不到锁都会写），所以这里不会误报。
+ */
+function missedRun(currentPid) {
+  const armed = readArmed();
+  if (!armed) return null;
+  if (Number(armed.waitedPid) === Number(currentPid)) return null;
+  if (pidAlive(armed.helperPid)) return null;
+  const rep = readAutoReport();
+  const repAt = rep && typeof rep.at === 'string' ? rep.at : '';
+  if (repAt && repAt >= String(armed.at ?? '')) return null;
+  return armed;
 }
 function pidAlive(pid) {
   const n = Number(pid);
@@ -834,6 +870,8 @@ function cmdAutoWait(opts) {
   const arm = readArm();
   if (arm === null || arm.enabled !== true) {
     autoLog(`自动清理：开关关闭（arm=${arm === null ? '缺失' : JSON.stringify({ enabled: arm.enabled })}），未做任何改动`);
+    // 也留一份报告：否则面板会一直显示上一轮的结果，看不出「这轮是因为开关关着才没动」。
+    writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'disabled' });
     say('自动清理：开关关闭，未做任何改动。');
     emit();
     return;
@@ -864,6 +902,7 @@ function cmdAutoWait(opts) {
   for (let i = 0; !locked && i < 90; i++) {
     if (readArm().enabled !== true) {
       autoLog('自动清理：等锁期间开关被关掉，退出');
+      writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'disabled' });
       say('自动清理：开关已关闭，退出。');
       emit();
       return;
@@ -874,6 +913,7 @@ function cmdAutoWait(opts) {
   }
   if (!locked) {
     autoLog('自动清理：另一个助手迟迟不退出，本次放弃');
+    writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'lock-busy', waitedPid: pid });
     say('自动清理：已有另一个助手在执行，退出。');
     emit();
     return;
@@ -968,7 +1008,7 @@ function usage() {
 // 真正的写操作仍只走本文件的 CLI（必须完全退出 DSH）。
 export { DSH_HOME, SESS_ROOT, CACHE_ROOT, STATE_DIR, BACKUP_ROOT, VERSION, CATALOG_TYPE, DISMISS_TYPE };
 export { frameLength, frameTexts, inspect, readCache, listSessions, allSessionIds, emptyCatalogState, rebuildDismiss };
-export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, pidAlive, cmdAutoWait };
+export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_ARMED, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, readArmed, writeArmed, missedRun, pidAlive, cmdAutoWait };
 export { dshProcessIds, otherDshPids };
 
 /** 只有被 `node clean.mjs …`（或包装脚本）直接调用时才跑 CLI；被插件 import 时只导出、不执行。 */

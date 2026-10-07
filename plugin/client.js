@@ -196,6 +196,8 @@ function registerWithLoader() {
       if (!report) return '还没有自动清理的记录（助手只在你完全退出 DSH 之后动手）。'
       const why = {
         timeout: '等待 DSH 退出超时，未做任何改动',
+        disabled: '开关是关闭的，未做任何改动',
+        'lock-busy': '已有另一个助手在跑（等了 3 分钟），本次放弃',
         'other-dsh-running': (Array.isArray(report.otherPids) && report.otherPids.length
           ? `检测到另一个 DSH 实例仍在运行（pid ${report.otherPids.join('、')}），本次跳过`
           : '检测到另一个 DSH 实例仍在运行，本次跳过'),
@@ -359,6 +361,13 @@ function registerWithLoader() {
                 + '助手只在看到 DSH 进程真的消失后才动盘，动作等价于你自己敲那条命令。',
               ),
               h('div', { style: { marginTop: '4px', fontSize: '11.5px' } }, describeAuto(auto && auto.lastAuto)),
+              auto && auto.lastMissed
+                ? h('div', { style: { marginTop: '2px', fontSize: '11.5px', color: '#d9534f' } },
+                  `⚠ 上一次退出时自动清理没跑完：为 pid ${auto.lastMissed.waitedPid} 架设的助手`
+                  + `${auto.lastMissed.helperPid ? `（pid ${auto.lastMissed.helperPid}）` : ''}在 `
+                  + `${auto.lastMissed.at || '架设之后'} 之后就消失了，没留下任何报告 —— `
+                  + '它多半是被系统或别的工具一起结束了。再完全退出一次 DSH 就会重试。')
+                : null,
               autoFailures(auto && auto.lastAuto).length
                 ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11px' } },
                   autoFailures(auto && auto.lastAuto).map((f, i) =>
