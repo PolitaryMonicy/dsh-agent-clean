@@ -179,15 +179,22 @@ Two more constraints (handled by the tool):
 - `orphans` only touches files under `storages/session_projcache/sessions/`.
 - `purge` backs up **all generation logs** (`session.v3/v4…`) plus the cache, then removes the session directory; `restore` recreates it.
 - The auto-clean helper (2.2) is **only ever armed, never in-process**: it waits for the DSH pid to disappear, takes a
-  pid-and-timestamp lock so two helpers cannot run at once, skips the window entirely if another DSH instance is
+  pid-and-timestamp lock so two helpers cannot run at once (if a previous helper is still finishing, this one waits up
+  to 3 minutes instead of burning the whole window), skips the window entirely if another DSH instance is
   still running (**the helper itself runs as `DeepSeek Harness.exe` with `ELECTRON_RUN_AS_NODE=1`, so its own pid is
   always excluded from that check**; leftover GPU/renderer children get a 10-second grace), and then goes through exactly the same backup → mirror self-check → real-loader verification path
   as `dismiss --all --apply`. A switch turned off mid-session needs no kill: the waiting helper re-reads
   `auto-arm.json` and exits untouched.
+- **Forked sessions**: the first part of such a log is the parent's **inherited region**
+  (`identity.inheritedEventCount`) and may contain the parent's own `subagent/catalog` rows. Those rows do not belong
+  to this session: they are kept **byte-for-byte**, and the self-check must **not** count them as "remaining
+  catalog" — otherwise any fork with inherited catalog rows fails the self-check forever and can never be cleaned.
+  The projection cache is then written as `{"inheritedEventCount":N}`. When an auto-clean run does fail, the settings
+  page now prints the per-session reason (`report.results[].why`) as well.
 
 ## 6. How correctness is proven
 
-- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **33/33 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, and the auto-clean "is another DSH instance running?" check that must **not** match the helper itself); **36/36 pass** with a real-log fixture (section below).
+- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **39/39 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself, and a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence); **42/42 pass** with a real-log fixture (section below).
 - **Offline probes** for the two plugin halves (no DSH, no writes to session storage):
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS` — fakes `window.__ModuleLoader__` and a minimal React
     to prove the settings slot is registered exactly once, that a late `slots` service is still picked up through

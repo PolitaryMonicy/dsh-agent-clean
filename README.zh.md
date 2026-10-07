@@ -165,15 +165,20 @@ DSH 客户端只读**投影缓存**里的 `projectionsBySession[].values.subagen
 - `orphans` 只动 `storages/session_projcache/sessions/` 下的缓存文件，不碰会话目录。
 - `purge` 会备份**全部 generation 日志**（`session.v3/v4…`）与缓存，然后删除会话目录；`restore` 会重建目录。
 - 自动清理助手（2.2）**只被架设、绝不在本进程里动手**：它等 DSH 的 pid 消失，用「pid ＋ 时间戳」的锁保证同时只有一个
-  助手在跑，若那一刻还有另一个 DSH 实例在运行则整轮跳过（**助手自己就是用 `DeepSeek Harness.exe` ＋
+  助手在跑（若那会儿确有另一个助手在收尾，本次助手最多等 3 分钟再决定，不会一见锁就白跑一轮），若那一刻还有另一个
+  DSH 实例在运行则整轮跳过（**助手自己就是用 `DeepSeek Harness.exe` ＋
   `ELECTRON_RUN_AS_NODE=1` 跑的，所以这道判定必须排除它自己的 pid**；主进程刚退出时残留的 GPU/渲染子进程有
   10 秒宽限），然后走与 `dismiss --all --apply` 一模一样的
   备份 → 镜像自检 → 真实加载器复核流程。开关在会话中途关掉也不需要杀进程：还在等的助手会重读
   `auto-arm.json` 后原样退出。
+- **分叉会话（fork）**：这类日志前半段是父会话的**继承区**（`identity.inheritedEventCount`），里面可能也有父会话的
+  `subagent/catalog` 行。它们不归本会话，清理时**逐字节保留**，自检也**不能**把它们算作「剩余 catalog」——
+  否则只要日志里有继承来的 catalog 行就会恒判自检失败、一个分叉会话也清不掉。清理后投影缓存写成
+  `{"inheritedEventCount":N}`（不继承父会话的目录，父会话自己那份照旧）。
 
 ## 六、怎么证明它是对的
 
-- **自带回归测试**（不碰真实数据）：`node test/selftest.mjs` → **33/33 通过**（假 `DSH_HOME`，覆盖 list／orphans／purge+restore／dismiss 安全闸／离线变换／restore 回滚，以及自动清理的「是不是还有另一个 DSH 实例」判定——它**不能**把助手自己算进去）；带真实日志 fixture 时 **36/36 通过**（见下条）。
+- **自带回归测试**（不碰真实数据）：`node test/selftest.mjs` → **39/39 通过**（假 `DSH_HOME`，覆盖 list／orphans／purge+restore／dismiss 安全闸／离线变换／restore 回滚，自动清理的「是不是还有另一个 DSH 实例」判定——它**不能**把助手自己算进去，以及**分叉会话**：继承区里的 catalog 行必须逐字节保留、自己那几条必须改掉、缓存写成带 fence 的空状态）；带真实日志 fixture 时 **42/42 通过**（见下条）。
 - **两半插件各自的离线探针**（不启动 DSH、不碰会话存储）：
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS`：伪造 `window.__ModuleLoader__` 与极简 React，证明设置页座位只注册一次、`slots` 服务迟到时靠 `internal/service` 补挂且幂等、宿主没有 `slots` 时也不抛。
   - `npm run probe:host` → `VERDICT PASS`：用假请求驱动宿主半的两条路由 —— 栅栏 403／405、`scan` 返回体形状、`POST /settings` 的全部分支（坏体、无可写字段、关、开、不重复架设）。它会先备份再还原 `auto-arm.json`，并以 `DSAC_ARM_DRYRUN=1` 干跑，**不开真进程、不跑任何清理**。

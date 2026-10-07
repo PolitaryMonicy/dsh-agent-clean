@@ -73,11 +73,11 @@ const tailRow = JSON.stringify({ seq: 3, type: 'session-log-deepseek/delivery-ac
 const headerRow = (id) => JSON.stringify({ sessionFormatVersion: 4, id, createdAt: '2026-01-01T00:00:00.000Z' });
 
 function mkProject(name) { fs.mkdirSync(path.join(SESS, PROJ, name), { recursive: true }); return path.join(SESS, PROJ, name); }
-function mkCache(id, title, catalogValues) {
+function mkCache(id, title, catalogValues, inherited = 0) {
   const j = {
     version: 7,
     record: {
-      identity: { sessionId: id, inheritedEventCount: 0 },
+      identity: { sessionId: id, inheritedEventCount: inherited },
       rows: {
         title: { seq: 0, val: title },
         subagentCatalog: { seq: 2, val: catalogValues ? { head: { values: catalogValues, lastSeq: 2 } } : {} },
@@ -104,6 +104,21 @@ const dirChild = mkProject(CHILD);
 const logChild = path.join(dirChild, 'session.v4.jsonl.zstd');
 fs.writeFileSync(logChild, Buffer.concat([frame([headerRow(CHILD), metaRow, msgRow])]));
 const cacheChild = mkCache(CHILD, '子代理会话（目录名无 session- 前缀）', null);
+// 分叉会话（fork）：日志前半段是父会话的**继承区**（seq < inheritedEventCount），
+// 其中也可能有父会话的 subagent/catalog 行 —— 它们不归本会话，清理时必须逐字节保留。
+// 1.3.1 的自检漏了这道 fence，于是「只要日志里有继承来的 catalog 行就恒判自检失败」，
+// 分叉会话永远清不掉（本用例是那次的回归测试）。
+const F = 'session-ffff6666-6666-6666-6666-666666666666';
+const INHERITED = 3;
+const inhCatRow = JSON.stringify({ seq: 2, type: 'subagent/catalog', ignorable: false, data: { childId: 'p1', label: 'parent child' } });
+const ownCatRow = JSON.stringify({ seq: 4, type: 'subagent/catalog', ignorable: false, data: { childId: 'o1', label: 'own child' } });
+const dirF = mkProject(F);
+const logF = path.join(dirF, 'session.v4.jsonl.zstd');
+fs.writeFileSync(logF, Buffer.concat([
+  frame([headerRow(F), metaRow, msgRow, inhCatRow]),
+  frame([JSON.stringify({ seq: 3, type: 'message/user', data: { text: 'after fork' } }), ownCatRow]),
+]));
+const cacheF = mkCache(F, '分叉会话 F', [{ label: 'parent child', childId: 'p1' }, { label: 'own child', childId: 'o1' }], INHERITED);
 
 console.log(`临时 DSH_HOME: ${HOME}`);
 console.log(`（真实 DSH_HOME 与真实备份目录都不会被碰）\n`);
@@ -120,7 +135,7 @@ function run(args, extraEnv = {}) {
 console.log('1) list');
 let r = run(['list']);
 check('list 退出码 0', r.code === 0, `code=${r.code}`);
-check('list 认出 1 个含条目的会话', /共 3 个会话，其中 1 个含/.test(r.out), r.out.split('\n')[0]);
+check('list 认出 2 个含条目的会话', /共 4 个会话，其中 2 个含/.test(r.out), r.out.split('\n')[0]);
 check('list 显示日志中 2 条', /日志中 2 条/.test(r.out), r.out.match(/条目.*$/m)?.[0]);
 
 // ---- 2. orphans ------------------------------------------------------------
@@ -203,6 +218,25 @@ try { pidJson = JSON.parse(String(pidProbe.stdout || '').trim()); } catch { pidJ
 check('otherDshPids 排除助手自己与被等的 pid',
   JSON.stringify(pidJson.kept) === '[4321,5555]' && JSON.stringify(pidJson.onlySelf) === '[]',
   `code=${pidProbe.status} out=${String(pidProbe.stdout || '').trim().slice(0, 120)} err=${String(pidProbe.stderr || '').trim().slice(0, 160)}`);
+
+// ---- 6c. 分叉会话：继承区不得被清算，也不能被自检挡住 ----------------------
+console.log('\n6c) 分叉会话（继承区）的 dismiss');
+const inhBefore = linesOf(logF);
+r = run(['dismiss', '--session', 'ffff6666', '--apply', '--force', '--no-app', '--no-verify']);
+const inhAfter = linesOf(logF);
+check('分叉会话 dismiss 退出码 0（不再被自检挡住）', r.code === 0 && !/自检未通过/.test(r.out), `code=${r.code}\n${r.out.slice(-700)}`);
+check('输出交代继承来的条数', /另继承而来、按规定不动 1 条/.test(r.out), String(r.out.match(/自检:.*$/m)?.[0]));
+check('自己的 catalog 已清零、行数与 seq 都不变',
+  /剩余 catalog\(自己的\)=0/.test(r.out) && inhAfter.length === inhBefore.length
+  && JSON.stringify(inhAfter.map((l) => JSON.parse(l).seq)) === JSON.stringify(inhBefore.map((l) => JSON.parse(l).seq)),
+  String(r.out.match(/自检:.*$/m)?.[0]));
+const inhIdx = inhAfter.findIndex((l) => l.includes('"parent child"'));
+const ownIdx = inhAfter.findIndex((l) => l.includes('"own child"'));
+check('继承区那行逐字节未动', inhIdx >= 0 && inhAfter[inhIdx] === inhBefore[inhIdx] && JSON.parse(inhAfter[inhIdx]).type === 'subagent/catalog', String(inhAfter[inhIdx]));
+check('自己那行改成了 dismissed + ignorable', ownIdx >= 0 && JSON.parse(inhAfter[ownIdx]).type === 'subagent/catalog-dismissed' && JSON.parse(inhAfter[ownIdx]).ignorable === true, String(inhAfter[ownIdx]));
+check('投影缓存写成带 fence 的空状态',
+  JSON.stringify(JSON.parse(fs.readFileSync(cacheF, 'utf8')).record.rows.subagentCatalog.val) === `{"inheritedEventCount":${INHERITED}}`,
+  JSON.stringify(JSON.parse(fs.readFileSync(cacheF, 'utf8')).record.rows.subagentCatalog.val));
 
 // ---- 7. 可选：真实日志的 dismiss 回归 --------------------------------------
 if (FIXTURE) {

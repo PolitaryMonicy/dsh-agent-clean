@@ -413,7 +413,7 @@ function rebuildDismiss(buf, inherited) {
   const nb = Buffer.concat(out);
   const before = frameTexts(buf).flatMap((f) => f.lines);
   const after = frameTexts(nb).flatMap((f) => f.lines);
-  let dense = true, untouched = true, catalog = 0, dismissed = 0;
+  let dense = true, untouched = true, catalog = 0, inheritedCatalog = 0, dismissed = 0;
   // 真实 v4 日志第 0 行是 header（没有 seq），事件从第 1 行起、seq 从 0 起；
   // 若首行本身就是 seq 0（例如自测造的日志），则从第 0 行起算。
   let offset = 1;
@@ -421,11 +421,15 @@ function rebuildDismiss(buf, inherited) {
   for (let i = offset; i < after.length; i++) {
     const ev = JSON.parse(after[i]);
     if (ev.seq !== i - offset) dense = false;
-    if (ev.type === CATALOG_TYPE) catalog++;
+    // 分叉会话（fork）的日志里前半段是父会话的**继承区**：seq < inherited 的 catalog 行不归本会话，
+    // 清理时必须原样保留，自检也不能把它们算作「剩余 catalog」——1.3.1 就是漏了这道 fence，
+    // 只要日志里有继承来的 catalog 行就恒判自检失败、永远放弃写入。
+    const isInherited = typeof ev.seq === 'number' && ev.seq < inherited;
+    if (ev.type === CATALOG_TYPE) { if (isInherited) inheritedCatalog++; else catalog++; }
     if (ev.type === DISMISS_TYPE) dismissed++;
-    if (before[i] !== after[i] && JSON.parse(before[i]).type !== CATALOG_TYPE) untouched = false;
+    if (before[i] !== after[i] && (isInherited || JSON.parse(before[i]).type !== CATALOG_TYPE)) untouched = false;
   }
-  return { buf: nb, retyped, rewritten, detail, dense, untouched, rowsSame: before.length === after.length, rows: after.length, catalog, dismissed };
+  return { buf: nb, retyped, rewritten, detail, dense, untouched, rowsSame: before.length === after.length, rows: after.length, catalog, inheritedCatalog, dismissed };
 }
 /** 空目录在投影 stateSchema 下的合法形状：只有 inheritedEventCount，不能带 head（head.values 要求 >=1 项）。 */
 function emptyCatalogState(inherited) { return { inheritedEventCount: inherited ?? 0 }; }
@@ -540,15 +544,20 @@ function dismissOne(s, opts) {
   const inherited = s.cache.inherited ?? 0;
   if (inherited) say(`  分叉会话：继承父会话事件 ${inherited} 条（继承来的 catalog 行原样保留，不动）`);
   const minutesIdle = (Date.now() - s.mtime.getTime()) / 60000;
-  if (minutesIdle < 5 && !opts.force) { say(`  ⚠ 该日志 ${minutesIdle.toFixed(1)} 分钟前还被写入。加 --force 才继续。`); say(''); return { ok: false }; }
+  if (minutesIdle < 5 && !opts.force) { say(`  ⚠ 该日志 ${minutesIdle.toFixed(1)} 分钟前还被写入。加 --force 才继续。`); say(''); return { ok: false, why: `日志 ${minutesIdle.toFixed(1)} 分钟前还被写入（未加 --force）` }; }
   const buf = readFileSync(s.logPath);
   const info = inspect(buf, inherited);
   if (!info.catalog) { say('  该日志没有「自己的」catalog 行，无需处理。'); say(''); return { ok: true, changed: 0 }; }
   const r = rebuildDismiss(buf, inherited);
   say(`  ${s.logName}: ${info.rows} 行 -> ${r.rows} 行（行数不变）  ${buf.length} B -> ${r.buf.length} B  改写 ${r.retyped} 条，重压 ${r.rewritten} 帧`);
   for (const d of r.detail) say(`      ${d}`);
-  say(`  自检: seq 稠密=${r.dense}  非 catalog 行逐字节不变=${r.untouched}  剩余 catalog=${r.catalog}  dismissed=${r.dismissed}`);
-  if (!r.dense || !r.untouched || r.catalog || r.rowsSame === false) { say('  ✗ 自检未通过，放弃写入。'); say(''); return { ok: false }; }
+  const ownLeft = `剩余 catalog(自己的)=${r.catalog}${r.inheritedCatalog ? `（另继承而来、按规定不动 ${r.inheritedCatalog} 条）` : ''}`;
+  say(`  自检: seq 稠密=${r.dense}  非 catalog 行逐字节不变=${r.untouched}  ${ownLeft}  dismissed=${r.dismissed}`);
+  if (!r.dense || !r.untouched || r.catalog || r.rowsSame === false) {
+    say('  ✗ 自检未通过，放弃写入。');
+    say('');
+    return { ok: false, why: `离线自检未通过（seq 稠密=${r.dense} 非 catalog 行未动=${r.untouched} 剩余自己的 catalog=${r.catalog} 行数一致=${r.rowsSame !== false}）` };
+  }
   // 用真实加载器在镜像根里先验证
   const projectDir = s.project;
   const mirrorDir = join(MIRROR_ROOT, projectDir, s.sessionId);
@@ -561,12 +570,12 @@ function dismissOne(s, opts) {
   } catch (e) { verified = { skipped: true, why: '镜像自检出错: ' + String(e).slice(0, 120) }; }
   if (verified.skipped) {
     say(`  真实加载器自检: 跳过（${verified.why}）`);
-    if (!opts.noVerify) { say('  ✗ 未做真实加载器自检；确实要写入请显式加 --no-verify。'); say(''); return { ok: false }; }
+    if (!opts.noVerify) { say('  ✗ 未做真实加载器自检；确实要写入请显式加 --no-verify。'); say(''); return { ok: false, why: `未做真实加载器自检（${verified.why}）` }; }
     say('  ⚠ --no-verify：本次写入未经真实加载器验证，风险自担。');
   } else {
     say(`  真实加载器自检(${verified.via}): ${verified.ok ? 'OK' : '✗ 失败'}  投影条目=${verified.entries ?? '?'}`);
     for (const line of verified.text.split('\n').filter((l) => /RESULT|PROJECTION|subagent\/catalog|cause/.test(l))) say(`      ${line.trim()}`);
-    if (!verified.ok || verified.entries !== 0) { say('  ✗ 真实加载器未通过，放弃写入。'); say(''); return { ok: false }; }
+    if (!verified.ok || verified.entries !== 0) { say('  ✗ 真实加载器未通过，放弃写入。'); say(''); return { ok: false, why: `真实加载器自检未通过（投影条目=${verified.entries ?? '?'}）` }; }
   }
   const cachePatch = [];
   if (s.cachePath) {
@@ -849,8 +858,22 @@ function cmdAutoWait(opts) {
     }
     sleepSync(2000);
   }
-  if (!claimLock()) {
-    autoLog('自动清理：已有另一个助手在跑，退出');
+  // 抢锁要有耐心：若上一次退出时留下的助手还占着锁（例如它跑得慢、或它用的是旧版代码），
+  // 一见锁就退出等于白白浪费一整轮退出窗口。这里最多等 3 分钟，并每轮重读开关。
+  let locked = claimLock();
+  for (let i = 0; !locked && i < 90; i++) {
+    if (readArm().enabled !== true) {
+      autoLog('自动清理：等锁期间开关被关掉，退出');
+      say('自动清理：开关已关闭，退出。');
+      emit();
+      return;
+    }
+    if (i % 5 === 0) autoLog(`自动清理：已有另一个助手在跑，等它退出（${i + 1}/90）`);
+    sleepSync(2000);
+    locked = claimLock();
+  }
+  if (!locked) {
+    autoLog('自动清理：另一个助手迟迟不退出，本次放弃');
     say('自动清理：已有另一个助手在执行，退出。');
     emit();
     return;
@@ -893,7 +916,8 @@ function cmdAutoWait(opts) {
   const results = [];
   for (const s of targets) {
     const r = dismissOne(s, useOpts);
-    results.push({ sessionId: s.sessionId, ok: r.ok === true, changed: r.changed ?? 0, backup: r.backup ?? null });
+    if (r.ok !== true) autoLog(`自动清理：${s.sessionId} 未处理 —— ${r.why ?? '未知原因'}`);
+    results.push({ sessionId: s.sessionId, ok: r.ok === true, changed: r.changed ?? 0, backup: r.backup ?? null, why: r.why ?? null });
   }
   const cleaned = results.filter((r) => r.changed > 0).length;
   const failures = results.filter((r) => !r.ok).length;

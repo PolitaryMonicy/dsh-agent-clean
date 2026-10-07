@@ -206,6 +206,14 @@ function registerWithLoader() {
         + `失败 ${report.failures ?? '?'} 个${backups ? `，备份 ${backups} 份` : ''}`
     }
 
+    /** 上次自动清理里没处理成功的会话与原因 —— 面板是唯一能看见原因的地方。 */
+    function autoFailures(report) {
+      if (!report || !Array.isArray(report.results)) return []
+      return report.results
+        .filter((r) => r && r.ok !== true)
+        .map((r) => ({ sessionId: r.sessionId, why: r.why }))
+    }
+
     function CommandLine({ label, command, hint }) {
       return h('div', { style: { marginTop: '5px' } },
         h('div', { style: S.row },
@@ -351,6 +359,11 @@ function registerWithLoader() {
                 + '助手只在看到 DSH 进程真的消失后才动盘，动作等价于你自己敲那条命令。',
               ),
               h('div', { style: { marginTop: '4px', fontSize: '11.5px' } }, describeAuto(auto && auto.lastAuto)),
+              autoFailures(auto && auto.lastAuto).length
+                ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11px' } },
+                  autoFailures(auto && auto.lastAuto).map((f, i) =>
+                    h('div', { key: i }, `· 没处理成：${shortId(f.sessionId)} —— ${f.why || '原因未记录（旧版助手的报告）'}`)))
+                : null,
               note ? h('div', { style: { marginTop: '3px', fontSize: '11.5px', color: note.indexOf('失败') === 0 ? '#d9534f' : 'GrayText' } }, note) : null,
               auto && auto.armFile
                 ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11px' } }, `开关文件：${auto.armFile}`)
