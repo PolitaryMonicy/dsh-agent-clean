@@ -44,6 +44,7 @@
   "icon": "./assets/icon.svg",
   "scripts": {
     "selftest": "node test/selftest.mjs",
+    "probe:client": "node test/client-slot-probe.mjs",
     "help": "node clean.mjs --help"
   },
   "keywords": [
