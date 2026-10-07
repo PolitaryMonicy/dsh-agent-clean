@@ -45,6 +45,7 @@
   "scripts": {
     "selftest": "node test/selftest.mjs",
     "probe:client": "node test/client-slot-probe.mjs",
+    "prepublishOnly": "npm run selftest",
     "help": "node clean.mjs --help"
   },
   "keywords": [
@@ -62,7 +63,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/PolitaryMonicy/dsh-agent-clean.git"
+    "url": "git+https://github.com/PolitaryMonicy/dsh-agent-clean.git"
   },
   "homepage": "https://github.com/PolitaryMonicy/dsh-agent-clean#readme",
   "bugs": {

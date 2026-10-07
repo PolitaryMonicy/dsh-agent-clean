@@ -8,3 +8,7 @@ out_*.txt
 node_modules/
 .DS_Store
 Thumbs.db
+
+# npm 发布凭据：里面是 Automation/Granular Token，绝不能入库
+.npmrc
+*.tgz
