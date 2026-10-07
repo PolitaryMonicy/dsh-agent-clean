@@ -131,9 +131,17 @@ function registerWithLoader() {
       const load = useCallback(() => {
         setState((prev) => ({ phase: 'loading', value: prev.value }))
         fetch(SCAN_ROUTE, { headers: { accept: 'application/json' }, cache: 'no-store' })
-          .then((res) => res.json())
-          .then((payload) => {
-            if (!payload || payload.ok !== true) {
+          .then(async (res) => {
+            // 不要直接 res.json()：路由不存在时宿主回的是空体/HTML，那样只会得到
+            // 「Unexpected end of JSON input」，看不出是 404 还是别的。
+            const text = await res.text()
+            let payload
+            try { payload = text ? JSON.parse(text) : undefined } catch { payload = undefined }
+            if (!res.ok || payload === undefined) {
+              const snippet = text ? text.slice(0, 160).replace(/\s+/g, ' ') : '(空响应体)'
+              throw new Error(`宿主返回 HTTP ${res.status}：${snippet}`)
+            }
+            if (payload.ok !== true) {
               throw new Error((payload && payload.error && payload.error.message) || '宿主返回了失败结果')
             }
             setState({ phase: 'ready', value: payload.value })
@@ -227,7 +235,8 @@ function registerWithLoader() {
           ? h('div', { style: { ...S.card, color: '#d9534f' } },
             `读取失败：${state.message}`,
             h('div', { style: { ...S.muted, fontSize: '11.5px', marginTop: '4px' } },
-              '宿主半可能没有加载（看主进程日志里有没有 [dsh-agent-clean] host half applied）。'),
+              '宿主半可能没有加载或加载失败。请在终端里跑 "dsh --profile desktop --dump-config" 看组合树，',
+              '并查看失败日志 %TEMP%\\dsh-agent-clean-host.log（主进程控制台里应能看到 [dsh-agent-clean] host half applied）。'),
           )
           : null,
 

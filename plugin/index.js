@@ -13,7 +13,8 @@
  * 复用的是同一个包里的 `../clean.mjs`（已逐字节验证过的实现），不另写一套扫描逻辑。
  * clean.mjs 里有「直接被调用才跑 CLI」的守卫，import 它不会执行任何命令。
  */
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { appendFileSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -41,6 +42,38 @@ const MAX_SESSIONS = 300
 
 /** 本包根目录（= 插件安装目录），用来告诉面板「清理命令」该指向哪个包装脚本。 */
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+/**
+ * 宿主半的失败日志。桌面版的宿主 stdout 是控制台（看不到），而 Loader 的
+ * 「did not activate」告警也只写到 stderr，所以加载/注册失败时**额外落一份盘**，
+ * 让面板和用户都能找到原因。只在失败时写。
+ */
+const HOST_LOG = join(tmpdir(), 'dsh-agent-clean-host.log')
+
+function trace(message) {
+  try {
+    appendFileSync(HOST_LOG, `${new Date().toISOString()} ${message}\n`)
+  } catch {
+    /* 只读环境：忽略 */
+  }
+}
+
+/**
+ * 取宿主自己的 `connection` 服务。**绝不要写 `ctx.get?.('connection') ?? ctx.connection`**：
+ * cordis 的 Context 代理对「已注册但本 fiber 未注入」的服务属性会抛
+ * `cannot get property "connection" without inject`（本插件 v1.1.0 就是死在
+ * `plugin/index.js:181` 这一句上，apply 中断 ⇒ 路由 404，而客户端半照常显示）。
+ * 反射式的 `ctx.get()` 在服务缺失时安静地返回 undefined，所以只用它。
+ */
+function readConnection(ctx) {
+  try {
+    const viaGet = ctx.get?.('connection')
+    if (viaGet !== undefined) return viaGet
+  } catch {
+    /* 老内核或代理差异：忽略，退回同源栅栏 */
+  }
+  return undefined
+}
 
 /** 统一的 JSON 信封：{ok:true,value} / {ok:false,error}（与 chat-manager 等插件一致）。 */
 function sendJson(res, status, payload) {
@@ -178,28 +211,41 @@ export function apply(ctx) {
   // 与 sidebar-qa 同样的理由：fiber 卡住时不会打任何日志，所以这一行是「插件到底有没有跑起来」的唯一信号。
   console.info(`[dsh-agent-clean] host half applied (v${VERSION})`)
 
-  const connection = ctx.get?.('connection') ?? ctx.connection
-  const isTrustedRequest = makeFence(connection)
+  try {
+    const connection = readConnection(ctx)
+    const isTrustedRequest = makeFence(connection)
 
-  const handler = (req, res) => {
-    if (!isTrustedRequest(req)) {
-      sendJson(res, 403, { ok: false, error: { code: 'forbidden', message: '请求未通过同源校验。' } })
-      return
+    const handler = (req, res) => {
+      if (!isTrustedRequest(req)) {
+        sendJson(res, 403, { ok: false, error: { code: 'forbidden', message: '请求未通过同源校验。' } })
+        return
+      }
+      if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: '只允许 GET／HEAD。' } })
+        return
+      }
+      try {
+        sendJson(res, 200, { ok: true, value: scan() })
+      } catch (error) {
+        sendJson(res, 500, {
+          ok: false,
+          error: { code: 'scan-failed', message: String((error && error.message) || error) },
+        })
+      }
     }
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'POST') {
-      sendJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: '只允许 GET／HEAD。' } })
-      return
+
+    const register = () => ctx.webServer.register({ kind: 'exact', path: SCAN_ROUTE, handler })
+    // 照 dsh-chat-manager 的做法：用 ctx.effect 注册（延迟、带标签、随 fiber 释放）。
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(register, 'dsh-agent-clean: read-only diagnostic route')
+    } else {
+      register()
     }
-    try {
-      sendJson(res, 200, { ok: true, value: scan() })
-    } catch (error) {
-      sendJson(res, 500, {
-        ok: false,
-        error: { code: 'scan-failed', message: String((error && error.message) || error) },
-      })
-    }
+    console.info(`[dsh-agent-clean] route ready: ${SCAN_ROUTE} (fence: ${connection === undefined ? 'same-origin fallback' : 'connection.requestRejection'})`)
+  } catch (error) {
+    // 绝不把异常抛回 Loader：那样整个宿主都可能被算作「entry did not activate」而且悄无声息。
+    const detail = String((error && error.stack) || error)
+    console.error(`[dsh-agent-clean] apply failed: ${detail}`)
+    trace(`apply failed: ${detail}`)
   }
-
-  ctx.webServer.register({ kind: 'exact', path: SCAN_ROUTE, handler })
-  console.info(`[dsh-agent-clean] route ready: ${SCAN_ROUTE}`)
 }

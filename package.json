@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-clean",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Remove subagent entries from DeepSeek Harness session logs without breaking the log, delete orphaned projection caches, and purge whole sessions — a CLI (dry-run by default, always with a backup) plus an optional read-only DSH panel that shows what needs cleaning.",
   "type": "module",
   "bin": {
