@@ -802,6 +802,38 @@ function writeArmed(rec) {
   } catch { /* 忽略 */ }
 }
 /**
+ * 助手心跳：等待期间每 60 秒刷新一次「最后活着的时刻」。
+ * 为什么需要它：只写 `auto-armed.json` 时，下一轮启动只知道「架设于几时、现在不见了」，
+ * 面板于是写成「在 <架设时间> 之后就消失了」—— 那是个误导（那是架设时间，不是消失时间）。
+ * 有了心跳，下一次就能说清是「刚架设就被连带杀掉」还是「守到退出窗口才没的」。
+ */
+const AUTO_HEARTBEAT = join(STATE_DIR, 'auto-heartbeat.json');
+function readHeartbeat() {
+  try {
+    const raw = readFileSync(AUTO_HEARTBEAT, 'utf8').replace(/^\uFEFF/, '');
+    const j = JSON.parse(raw);
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : null;
+  } catch { return null; }
+}
+function writeHeartbeat(waitedPid) {
+  try {
+    mkdirSync(dirname(AUTO_HEARTBEAT), { recursive: true });
+    writeFileSync(
+      AUTO_HEARTBEAT,
+      JSON.stringify({ pid: process.pid, waitedPid: Number(waitedPid) || null, at: new Date().toISOString() }) + '\n',
+      'utf8',
+    );
+  } catch { /* 忽略 */ }
+}
+let lastHeartbeatAt = 0;
+/** 最多每分钟落一次盘（等待可能长达 12 小时，不必每秒都写）。 */
+function heartbeat(waitedPid, force = false) {
+  const now = Date.now();
+  if (!force && now - lastHeartbeatAt < 60 * 1000) return;
+  lastHeartbeatAt = now;
+  writeHeartbeat(waitedPid);
+}
+/**
  * 上一轮架设的助手是不是「没跑完就没了」——宿主半启动时用它给用户一句明确的提示。
  * 三个条件同时成立才算：记录的不是本轮（被等的 pid 与当前进程不同）、那个助手进程已经不在、
  * 而且报告没有比架设时间更新（＝它连 timeout / 跳过 这样的报告都没留下，是真的一声不响消失了）。
@@ -815,7 +847,10 @@ function missedRun(currentPid) {
   const rep = readAutoReport();
   const repAt = rep && typeof rep.at === 'string' ? rep.at : '';
   if (repAt && repAt >= String(armed.at ?? '')) return null;
-  return armed;
+  // 心跳若属于**这个**助手，就带上「最后一次活着的时刻」：面板据此说清它是何时没的。
+  const hb = readHeartbeat();
+  const lastSeenAt = hb && Number(hb.pid) === Number(armed.helperPid) && typeof hb.at === 'string' ? hb.at : null;
+  return { ...armed, lastSeenAt };
 }
 function pidAlive(pid) {
   const n = Number(pid);
@@ -843,11 +878,91 @@ function dshProcessIds() {
   } catch { return []; }
 }
 /**
- * 除本助手与被等的那个 pid 之外，还有哪些 DSH 进程。
+ * 一个 DSH 实例**不止一个同名进程**。实测（1.3.4 之前的线上日志）：一次退出窗口里报出
+ * `pid 14152,11232,14412,12996,13660` 五个，其实是**同一个**新实例的
+ * 主进程 + gpu-process + utility(network) + renderer + host；再加上工具子进程
+ * （`dsh-subprocess-local/lib/runner.js`，跑的也是同一个 exe）与我们自己的助手（同一个 exe 跑 clean.mjs）。
+ * 只按镜像名数，就会把「一个实例」说成「五个实例」，还会把助手的同伴说成实例。
+ *
+ * 所以按命令行分角色，**只有主进程与 host 代表「一个实例还在跑」**：
+ * host 进程（`dsh-desktop-host/lib/index.js`）才是会话存储的属主，也就是被等的那个 pid。
+ */
+function classifyProcessCmd(cmd) {
+  const c = String(cmd ?? '');
+  if (!c) return 'other';
+  if (/(clean|verify_loader)\.mjs\b/.test(c)) return 'helper'; // 我们的脚本（同一个 exe 跑的）
+  if (/--type=/.test(c)) return 'child'; // Electron 的 gpu / renderer / utility 子进程
+  if (/dsh-desktop-host[\\/]/.test(c)) return 'host'; // 会话存储的属主
+  if (/dsh-subprocess-local[\\/]/.test(c)) return 'runner'; // 跑工具命令的 runner
+  if (/\.(mjs|cjs|js)\b/.test(c)) return 'runner'; // 其它 node 式脚本：不当成实例
+  return 'main'; // 不带参数的 Electron 主进程
+}
+const ROLE_LABEL = { main: '主进程', host: 'host 进程', other: '进程' };
+
+/** 当前所有 DSH 进程（pid／父 pid／命令行／角色）。Windows 优先用 CIM 取命令行，取不到退回 tasklist（角色未知）。 */
+function dshProcesses() {
+  if (IS_WIN) {
+    const rows = win32AppProcesses();
+    if (rows) return rows.map((r) => ({ ...r, role: classifyProcessCmd(r.cmd) }));
+    return dshProcessIds().map((pid) => ({ pid, ppid: 0, cmd: '', role: 'other' }));
+  }
+  return unixAppProcesses();
+}
+/** `powershell -NoProfile Get-CimInstance Win32_Process`（带命令行）。失败返回 null，由调用方回退。 */
+function win32AppProcesses() {
+  const ps = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const script = 'Get-CimInstance Win32_Process -Filter "Name=\'DeepSeek Harness.exe\'" | '
+    + 'Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress';
+  try {
+    const r = spawnSync(ps, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8', timeout: 15000, windowsHide: true, maxBuffer: 8 * 1024 * 1024,
+    });
+    if (r.error || r.status !== 0) return null;
+    const text = String(r.stdout ?? '').replace(/^\uFEFF/, '').trim();
+    if (!text) return [];
+    const parsed = JSON.parse(text);
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+    return arr
+      .filter((x) => x && Number.isInteger(Number(x.ProcessId)))
+      .map((x) => ({ pid: Number(x.ProcessId), ppid: Number(x.ParentProcessId) || 0, cmd: String(x.CommandLine ?? '') }));
+  } catch { return null; }
+}
+/** macOS／Linux：`ps` 里同样按「命令行含 DeepSeek Harness」筛（与 Windows 的镜像名过滤等价）。 */
+function unixAppProcesses() {
+  try {
+    const r = spawnSync('ps', ['-Ao', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10000 });
+    if (r.error || r.status !== 0) return [];
+    const out = [];
+    for (const line of String(r.stdout ?? '').split('\n')) {
+      if (!/DeepSeek Harness/.test(line)) continue;
+      const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+      if (m) out.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] });
+    }
+    return out.map((p) => ({ ...p, role: classifyProcessCmd(p.cmd) }));
+  } catch { return []; }
+}
+/**
+ * 除本助手与被等的那个 pid 之外，还有哪些**实例级**进程（主进程／host）。
  * **必须排除 process.pid**：助手自己就是用 DSH 的 exe 跑的（ELECTRON_RUN_AS_NODE=1），
  * 镜像名同样是「DeepSeek Harness.exe」—— 不排除自己就会永远判定「另一个实例在跑」，
  * 于是一次也不会执行（1.3.0 的实际故障就是这样：用户关掉 DSH 后助手仍看见自己）。
- * 主进程刚退出时它的 GPU/渲染子进程可能还残留一两秒，调用方用宽限重试处理，不在此处等待。
+ * `role:'other'` 是「命令行拿不到」的保守情形（tasklist 回退）：那时把每个同名进程都算上。
+ */
+function otherInstances(waitedPid, procs = dshProcesses()) {
+  const skip = new Set([process.pid]);
+  const waited = Number(waitedPid);
+  if (Number.isInteger(waited) && waited > 0) skip.add(waited);
+  return procs
+    .filter((p) => (p.role === 'main' || p.role === 'host' || p.role === 'other') && !skip.has(Number(p.pid)))
+    .map((p) => ({ pid: Number(p.pid), role: p.role }));
+}
+/** 「主进程 12404、host 7944」这样的一句话。 */
+function fmtInstances(list) {
+  return list.map((p) => `${ROLE_LABEL[p.role] ?? p.role} ${p.pid}`).join('、');
+}
+/**
+ * 只拿到 pid 列表（旧式 tasklist 回退）时的保守判定：把每个 pid 都当成可能的实例。
+ * 保留这个函数的形状是为了兼容性（自测 6b 用它锁住「必须排除助手自己」这条）。
  */
 function otherDshPids(waitedPid, ids = dshProcessIds()) {
   const skip = new Set([process.pid]);
@@ -865,7 +980,34 @@ function claimLock() {
   try { writeFileSync(AUTO_LOCK, JSON.stringify({ pid: process.pid, at: now }) + '\n', 'utf8'); return true; } catch { return false; }
 }
 
+/**
+ * 助手的外壳：任何未预料到的异常都要落成一份报告 + 一行日志，绝不静默消失。
+ * 1.3.3 的线上日志里就有「架设了、之后什么都没写、进程不见了」的助手；有了这层，
+ * 下一轮启动至少能分辨「它崩了（有 helper-crash 报告 + 错误原文）」还是「它被杀（只有心跳停在某刻）」。
+ */
 function cmdAutoWait(opts) {
+  const fatal = (error) => {
+    // 连「报丧」本身都不许再炸：这里每一项都各自 try，兜底只保证退出码非 0。
+    try {
+      const first = String((error && error.message) || error).split('\n')[0];
+      const detail = String((error && error.stack) || error).split('\n').slice(0, 4).join(' | ');
+      autoLog(`自动清理：助手异常退出 —— ${first}`);
+      writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'helper-crash', error: detail, waitedPid: Number(opts?.pid) || null });
+      say(`自动清理：助手异常退出（${first}）。`);
+      emit();
+    } catch { /* 忽略 */ }
+    process.exitCode = 1;
+  };
+  process.once('uncaughtException', fatal);
+  process.once('unhandledRejection', fatal);
+  try {
+    cmdAutoWaitInner(opts);
+  } catch (error) {
+    fatal(error);
+  }
+}
+
+function cmdAutoWaitInner(opts) {
   const pid = Number(opts.pid);
   const arm = readArm();
   if (arm === null || arm.enabled !== true) {
@@ -885,8 +1027,10 @@ function cmdAutoWait(opts) {
   }
   const maxWaitMs = Number.isFinite(Number(arm.maxWaitMs)) && Number(arm.maxWaitMs) > 0 ? Number(arm.maxWaitMs) : AUTO_DEFAULTS.maxWaitMs;
   const t0 = Date.now();
+  heartbeat(pid, true);
   autoLog(`自动清理：等 DSH pid=${pid} 退出（上限 ${Math.round(maxWaitMs / 60000)} 分钟）`);
   while (pidAlive(pid)) {
+    heartbeat(pid);
     if (Date.now() - t0 > maxWaitMs) {
       autoLog('自动清理：等待超时（DSH 似乎仍在运行），退出');
       writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'timeout', waitedPid: pid, waitedMs: Date.now() - t0 });
@@ -907,6 +1051,7 @@ function cmdAutoWait(opts) {
       emit();
       return;
     }
+    heartbeat(pid);
     if (i % 5 === 0) autoLog(`自动清理：已有另一个助手在跑，等它退出（${i + 1}/90）`);
     sleepSync(2000);
     locked = claimLock();
@@ -920,16 +1065,23 @@ function cmdAutoWait(opts) {
   }
   if (arm.checkOther !== false) {
     // 主进程刚退出时，它的 GPU/渲染子进程可能还残留一两秒 —— 宽限重判，别把这种残留当成「另一个实例」。
-    let others = otherDshPids(pid);
+    // 注意其它角色（子进程、runner、助手）**不参与判定**：一个实例有五六个同名进程，
+    // 全算上就会在「用户已经重新打开 DSH」之外的任何残留里误报（见 otherInstances 的注释）。
+    let others = otherInstances(pid);
     for (let i = 0; i < 10 && others.length; i++) {
-      autoLog(`自动清理：另见 DSH 进程 ${others.join(',')}，1 秒后重判（${i + 1}/10）`);
+      autoLog(`自动清理：另见 DSH 实例进程 ${fmtInstances(others)}，1 秒后重判（${i + 1}/10）`);
+      heartbeat(pid);
       sleepSync(1000);
-      others = otherDshPids(pid);
+      others = otherInstances(pid);
     }
     if (others.length) {
-      autoLog(`自动清理：检测到另一个 DSH 实例仍在运行（pid ${others.join(',')}），跳过（下次退出时再来）`);
-      writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'other-dsh-running', waitedPid: pid, otherPids: others });
-      say(`自动清理：检测到另一个 DSH 实例仍在运行（pid ${others.join(',')}），本次跳过。`);
+      const pids = others.map((o) => o.pid);
+      autoLog(`自动清理：检测到另一个 DSH 实例仍在运行（${fmtInstances(others)}），跳过（下次退出时再来）`);
+      writeAutoReport({
+        at: new Date().toISOString(), ran: false, why: 'other-dsh-running',
+        waitedPid: pid, otherPids: pids, otherRoles: others,
+      });
+      say(`自动清理：检测到另一个 DSH 实例仍在运行（${fmtInstances(others)}），本次跳过。`);
       emit();
       return;
     }
@@ -940,7 +1092,19 @@ function cmdAutoWait(opts) {
     noVerify: arm.verify === false,
     app: opts.app, asar: opts.asar, modules: opts.modules, noApp: opts.noApp,
   };
-  const all = listSessions();
+  let all = [];
+  try {
+    all = listSessions();
+  } catch (error) {
+    // 列会话这一步就炸了也要留痕：否则「助手一声不响地没了」永远查不出原因。
+    const first = String((error && error.message) || error).split('\n')[0];
+    autoLog(`自动清理：列会话失败 —— ${first}`);
+    writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'list-failed', error: first, waitedPid: pid });
+    say(`自动清理：列会话失败（${first}），未做任何改动。`);
+    emit();
+    process.exitCode = 1;
+    return;
+  }
   const targets = all.filter((s) => s.catalog > 0 || (s.cache.catalogCount ?? 0) > 0);
   say(`自动清理：DSH (pid ${pid}) 已退出，开始处理 ${targets.length} 个会话（${fmtTime(startedAt)}）`);
   if (!targets.length) {
@@ -955,7 +1119,14 @@ function cmdAutoWait(opts) {
   say(`自动清理：真实加载器复核途径 ${app ? `可用（${app.asar}）` : modules ? `可用（${modules}）` : '不可用（未加 --no-verify 将拒绝写入）'}`);
   const results = [];
   for (const s of targets) {
-    const r = dismissOne(s, useOpts);
+    heartbeat(pid);
+    // 单个会话炸掉不该把整轮带走：记成「这一个失败」，其它会话继续。
+    let r;
+    try {
+      r = dismissOne(s, useOpts);
+    } catch (error) {
+      r = { ok: false, changed: 0, backup: null, why: `抛出异常：${String((error && error.message) || error).split('\n')[0]}` };
+    }
     if (r.ok !== true) autoLog(`自动清理：${s.sessionId} 未处理 —— ${r.why ?? '未知原因'}`);
     results.push({ sessionId: s.sessionId, ok: r.ok === true, changed: r.changed ?? 0, backup: r.backup ?? null, why: r.why ?? null });
   }
@@ -1009,7 +1180,8 @@ function usage() {
 export { DSH_HOME, SESS_ROOT, CACHE_ROOT, STATE_DIR, BACKUP_ROOT, VERSION, CATALOG_TYPE, DISMISS_TYPE };
 export { frameLength, frameTexts, inspect, readCache, listSessions, allSessionIds, emptyCatalogState, rebuildDismiss };
 export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_ARMED, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, readArmed, writeArmed, missedRun, pidAlive, cmdAutoWait };
-export { dshProcessIds, otherDshPids };
+export { dshProcessIds, otherDshPids, dshProcesses, classifyProcessCmd, otherInstances, fmtInstances };
+export { AUTO_HEARTBEAT, readHeartbeat, writeHeartbeat };
 
 /** 只有被 `node clean.mjs …`（或包装脚本）直接调用时才跑 CLI；被插件 import 时只导出、不执行。 */
 const INVOKED_DIRECTLY = (() => {

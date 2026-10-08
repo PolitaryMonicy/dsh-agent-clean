@@ -125,6 +125,11 @@ async function main() {
   check('auto.lastAuto 允许为 null', v.auto?.lastAuto === null || typeof v.auto?.lastAuto === 'object')
   check('auto 带「上一轮有没有跑完」的判定位', 'lastMissed' in (v.auto ?? {}), JSON.stringify(v.auto?.lastMissed ?? null))
   check('auto 带助手记录文件路径', typeof v.auto?.armedFile === 'string' && v.auto.armedFile.endsWith('auto-armed.json'), v.auto?.armedFile)
+  // 1.3.4：面板要说清「本轮是谁在等谁」以及那个助手最后一次活着是什么时候 ——
+  // 只凭 auto-armed.json，用户看到「架设于 X，现已不在」会读成「架设完就死了」。
+  check('auto 带本轮助手记录与心跳',
+    ('armed' in (v.auto ?? {})) && ('heartbeat' in (v.auto ?? {})),
+    JSON.stringify({ armed: v.auto?.armed ?? null, heartbeat: v.auto?.heartbeat ?? null }))
 
   // settings: GET
   const g = await call(settings.handler, { method: 'GET', headers: LOOPBACK })

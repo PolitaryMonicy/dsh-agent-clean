@@ -3,11 +3,12 @@ backups/
 verify_root/
 out_*.txt
 *.log
-# 自动清理的状态文件（开关、上次报告、锁、助手架设记录）：本机运行态，不入库
+# 自动清理的状态文件（开关、上次报告、锁、助手架设记录、助手心跳）：本机运行态，不入库
 auto-arm.json
 auto-report.json
 auto.lock
 auto-armed.json
+auto-heartbeat.json
 
 # 依赖与系统垃圾
 node_modules/

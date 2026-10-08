@@ -180,17 +180,27 @@ Two more constraints (handled by the tool):
 - `purge` backs up **all generation logs** (`session.v3/v4…`) plus the cache, then removes the session directory; `restore` recreates it.
 - The auto-clean helper (2.2) is **only ever armed, never in-process**: it waits for the DSH pid to disappear, takes a
   pid-and-timestamp lock so two helpers cannot run at once (if a previous helper is still finishing, this one waits up
-  to 3 minutes instead of burning the whole window), skips the window entirely if another DSH instance is
-  still running (**the helper itself runs as `DeepSeek Harness.exe` with `ELECTRON_RUN_AS_NODE=1`, so its own pid is
-  always excluded from that check**; leftover GPU/renderer children get a 10-second grace), and then goes through exactly the same backup → mirror self-check → real-loader verification path
-  as `dismiss --all --apply`. A switch turned off mid-session needs no kill: the waiting helper re-reads
-  `auto-arm.json` and exits untouched.
+  to 3 minutes instead of burning the whole window), and skips the window entirely if another DSH instance is still
+  running. **"Another instance" must be decided by command line, not by image name**: one DSH instance has five or six
+  same-named processes (Electron main, GPU, network, renderer, host), and the tool runner plus the helper itself run the
+  same exe — counting by image name turned **one** instance into five in a real report. So only the **main process and
+  the host process** (owner of the session store, which is also the pid being waited for) count as an instance; the
+  helper itself, the waited pid, Electron children and runners never do (leftover children get a 10-second grace). It
+  then goes through exactly the same backup → mirror self-check → real-loader verification path as
+  `dismiss --all --apply`. A switch turned off mid-session needs no kill: the waiting helper re-reads `auto-arm.json`
+  and exits untouched, and a restarted host process will not arm a second helper while the previous one still waits for
+  the same pid.
 - **A silent no-show must be visible**: every time the host half arms the helper it records what is waiting for what in
-  `auto-armed.json`. On the next start, if that helper is gone and no report is newer than the arming record, the
-  settings page says so outright ("last exit's auto-clean did not finish"). (Measured lesson: a helper armed by a
-  host tool dies with that tool's process tree — nothing happens in the exit window and nothing is left on disk.)
-  Every terminal path writes a report — success, timeout, another instance running, switch off, lock busy — so this
-  check cannot false-alarm.
+  `auto-armed.json`, and while waiting the helper writes "last seen alive" to `auto-heartbeat.json` every 60 seconds. On
+  the next start, if that helper is gone and no report is newer than the arming record, the settings page says so — and
+  it only shows that warning in red when there is **actually something left to clean** (a skipped window with nothing to
+  do has no effect). The wording no longer claims it "disappeared after X" — that was the arming time, not the time it
+  died; with a heartbeat the page can say "last heartbeat …, now gone". (Measured lesson: a helper armed by a host tool
+  dies with that tool's process tree — nothing happens in the exit window and nothing is left on disk.) Every terminal
+  path writes a report — success, timeout, another instance running, switch off, lock busy, plus 1.3.4's helper crash
+  (`helper-crash`) and session-listing failure (`list-failed`) — and the helper shell installs
+  `uncaughtException` / `unhandledRejection` handlers, so the next start can always tell "it crashed (with the error
+  text)" from "it was killed along with something else (heartbeat stopped at …)".
 - **Forked sessions**: the first part of such a log is the parent's **inherited region**
   (`identity.inheritedEventCount`) and may contain the parent's own `subagent/catalog` rows. Those rows do not belong
   to this session: they are kept **byte-for-byte**, and the self-check must **not** count them as "remaining
@@ -200,7 +210,7 @@ Two more constraints (handled by the tool):
 
 ## 6. How correctness is proven
 
-- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **44/44 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself, a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, and the "a helper that never finished must not stay silent" check); **47/47 pass** with a real-log fixture (section below).
+- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **49/49 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners, a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, and the rule that a heartbeat is only trusted when it belongs to that very helper); **52/52 pass** with a real-log fixture (section below).
 - **Offline probes** for the two plugin halves (no DSH, no writes to session storage):
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS` — fakes `window.__ModuleLoader__` and a minimal React
     to prove the settings slot is registered exactly once, that a late `slots` service is still picked up through

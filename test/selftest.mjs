@@ -247,13 +247,16 @@ console.log('\n6d) missedRun（静默失败不能静默）');
 // 盘上也没有报告。宿主半启动时据此在设置页明说「上一轮没跑完」，而不是让用户干等。
 const armedFile = path.join(STATE, 'auto-armed.json');
 const reportFile = path.join(STATE, 'auto-report.json');
+const hbFile = path.join(STATE, 'auto-heartbeat.json');
 fs.mkdirSync(STATE, { recursive: true });
 const DEAD_PID = 999999; // 系统里几乎不可能存在的 pid
 const OLD_AT = new Date(Date.now() - 3600 * 1000).toISOString();
-function missedProbe({ armed, report, currentPid }) {
+function missedProbe({ armed, report, heartbeat, currentPid }) {
   fs.writeFileSync(armedFile, JSON.stringify(armed), 'utf8');
   if (report) fs.writeFileSync(reportFile, JSON.stringify(report), 'utf8');
   else fs.rmSync(reportFile, { force: true });
+  if (heartbeat) fs.writeFileSync(hbFile, JSON.stringify(heartbeat), 'utf8');
+  else fs.rmSync(hbFile, { force: true });
   const p = spawnSync(process.execPath, ['--input-type=module', '-e', `
 const m = await import(process.env.DSAC_TEST_CLEAN);
 process.stdout.write(JSON.stringify({ missed: m.missedRun(Number(process.env.DSAC_CUR_PID)) }));
@@ -269,6 +272,44 @@ check('记录的就是本轮（被等的 pid 是自己）→ 不报',
 check('助手进程还活着 → 不报（它还在等）',
   missedProbe({ armed: { ...armedDead, helperPid: process.pid }, report: null, currentPid: 777 }) === null);
 check('没有记录 → 不报', missedProbe({ armed: null, report: null, currentPid: 777 }) === null);
+// 1.3.4 的心跳：只写 auto-armed.json 时，面板只能说「架设于 X，现在不见了」——
+// 那会被读成「架设后立刻就死」。有了心跳才能分清「刚架设就被连带杀掉」与「守到退出窗口才没的」。
+const aliveAt = new Date(Date.now() - 60000).toISOString();
+check('心跳属于那个助手 → 报告里带上「最后一次活着」',
+  missedProbe({ armed: armedDead, report: null, heartbeat: { pid: DEAD_PID, waitedPid: 12345, at: aliveAt }, currentPid: 777 })?.lastSeenAt === aliveAt,
+  JSON.stringify(missedProbe({ armed: armedDead, report: null, heartbeat: { pid: DEAD_PID, waitedPid: 12345, at: aliveAt }, currentPid: 777 })));
+check('心跳是别的助手的 → 不冒充成它的',
+  missedProbe({ armed: armedDead, report: null, heartbeat: { pid: 4242, waitedPid: 12345, at: aliveAt }, currentPid: 777 })?.lastSeenAt === null);
+
+// ---- 6e. 进程角色：一个实例有五六个同名进程，只有主进程与 host 才算「实例」 ---
+console.log('\n6e) classifyProcessCmd / otherInstances（别把一个实例说成五个）');
+// 实测（1.3.4 之前的线上报告）：一次退出窗口报出 5 个「另一个 DSH 实例」，
+// 其实那是**同一个**新实例的主进程 + gpu + utility + renderer + host；
+// 助手自己与工具 runner 也是同一个 exe，同样会混进来。
+const roleProbe = spawnSync(process.execPath, ['--input-type=module', '-e', `
+const m = await import(process.env.DSAC_TEST_CLEAN);
+const exe = '"C:/x/DeepSeek Harness.exe"';
+const raw = [
+  { pid: 1, ppid: 0, cmd: exe + ' ' },
+  { pid: 2, ppid: 1, cmd: exe + ' --type=gpu-process --user-data-dir=C:/y' },
+  { pid: 3, ppid: 1, cmd: exe + ' --type=renderer' },
+  { pid: 4, ppid: 1, cmd: exe + ' --expose-internals "C:/y/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js"' },
+  { pid: 5, ppid: 4, cmd: exe + ' C:/z/clean.mjs autowait --pid 4' },
+  { pid: 6, ppid: 4, cmd: exe + ' "C:/y/dsh-subprocess-local/lib/runner.js" -- powershell' },
+  { pid: process.pid, ppid: 1, cmd: exe + ' C:/z/clean.mjs autowait --pid 1' },
+];
+const procs = raw.map((r) => ({ ...r, role: m.classifyProcessCmd(r.cmd) }));
+const others = m.otherInstances(4, procs);
+process.stdout.write(JSON.stringify({ roles: procs.map((p) => p.role), others, text: m.fmtInstances(others) }));
+`], { encoding: 'utf8', env: { ...process.env, DSH_HOME: HOME, DSAC_STATE_DIR: STATE, DSAC_TEST_CLEAN: pathToFileURL(CLEAN).href } });
+let roleJson = {};
+try { roleJson = JSON.parse(String(roleProbe.stdout || '').trim()); } catch { roleJson = {}; }
+check('角色分得清主进程／Electron 子进程／host／助手／runner',
+  JSON.stringify(roleJson.roles) === '["main","child","child","host","helper","runner","helper"]',
+  `code=${roleProbe.status} out=${String(roleProbe.stdout || '').trim().slice(0, 200)} err=${String(roleProbe.stderr || '').trim().slice(0, 200)}`);
+check('「另一个实例」只数主进程与 host（排除子进程、助手、runner、自己、被等的 pid）',
+  JSON.stringify(roleJson.others) === '[{"pid":1,"role":"main"}]', JSON.stringify(roleJson.others));
+check('实例描述写成「主进程 1」', roleJson.text === '主进程 1', String(roleJson.text));
 
 // ---- 7. 可选：真实日志的 dismiss 回归 --------------------------------------
 if (FIXTURE) {

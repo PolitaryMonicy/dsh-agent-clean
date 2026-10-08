@@ -36,9 +36,12 @@ import {
   allSessionIds,
   listSessions,
   missedRun,
+  pidAlive,
   readArm,
+  readArmed,
   readAutoReport,
   readCache,
+  readHeartbeat,
   writeArm,
   writeArmed,
 } from '../clean.mjs'
@@ -206,6 +209,9 @@ function autoState() {
     armedFile: AUTO_ARMED,
     lastAuto: readAutoReport(),
     lastMissed: startMissed,
+    // 本轮是谁在等谁 + 它最后一次心跳：设置页据此说明「助手还活着」还是「已经没了」。
+    armed: readArmed(),
+    heartbeat: readHeartbeat(),
   }
 }
 
@@ -225,6 +231,14 @@ function armHelper(reason) {
   if (helperArmed) return false
   const arm = readArm() ?? writeArm({})
   if (arm.enabled !== true) return false
+  // 宿主进程重启过、而上一轮那个助手还在等同一个 pid 时，不要再架一个：
+  // 1.3.3 的实测日志里同一个 pid 被架设了两次（09:18 与 09:29），两个助手都在等同一个退出窗口。
+  const prev = readArmed()
+  if (prev && Number(prev.waitedPid) === Number(process.pid) && pidAlive(prev.helperPid)) {
+    helperArmed = true
+    trace(`auto-clean helper already waiting for pid ${process.pid} (pid ${prev.helperPid})`)
+    return false
+  }
   // 离线探针用的开关：只登记状态、不真的开进程（否则测试跑完会留下一个真在等 pid 的助手）。
   if (process.env.DSAC_ARM_DRYRUN === '1') {
     helperArmed = true

@@ -192,15 +192,21 @@ function registerWithLoader() {
     }
 
     /** 「上次自动清理」的一句话说明。 */
+    const ROLE_ZH = { main: '主进程', host: 'host 进程', other: '进程' }
     function describeAuto(report) {
       if (!report) return '还没有自动清理的记录（助手只在你完全退出 DSH 之后动手）。'
       const why = {
         timeout: '等待 DSH 退出超时，未做任何改动',
         disabled: '开关是关闭的，未做任何改动',
         'lock-busy': '已有另一个助手在跑（等了 3 分钟），本次放弃',
-        'other-dsh-running': (Array.isArray(report.otherPids) && report.otherPids.length
-          ? `检测到另一个 DSH 实例仍在运行（pid ${report.otherPids.join('、')}），本次跳过`
-          : '检测到另一个 DSH 实例仍在运行，本次跳过'),
+        'helper-crash': `助手自己异常退出了${report.error ? `（${String(report.error).split('|')[0].trim()}）` : ''}`,
+        'list-failed': `列会话失败${report.error ? `（${report.error}）` : ''}`,
+        'other-dsh-running': (() => {
+          const parts = Array.isArray(report.otherRoles) && report.otherRoles.length
+            ? report.otherRoles.map((o) => `${ROLE_ZH[o.role] ?? o.role} ${o.pid}`).join('、')
+            : (Array.isArray(report.otherPids) && report.otherPids.length ? `pid ${report.otherPids.join('、')}` : '')
+          return parts ? `检测到另一个 DSH 实例仍在运行（${parts}），本次跳过` : '检测到另一个 DSH 实例仍在运行，本次跳过'
+        })(),
       }[report.why] || report.why || '未执行'
       if (report.ran !== true) return `上次未执行：${why}（${report.at || '时间未知'}）`
       const backups = Array.isArray(report.backups) ? report.backups.length : 0
@@ -358,15 +364,31 @@ function registerWithLoader() {
               ),
               h('div', { style: { ...S.muted, marginTop: '3px', fontSize: '11.5px' } },
                 '若退出时还有第二个 DSH 实例在跑，助手会跳过本次（下一个退出窗口再来）；'
-                + '助手只在看到 DSH 进程真的消失后才动盘，动作等价于你自己敲那条命令。',
+                + '助手只在看到 DSH 进程真的消失后才动盘，动作等价于你自己敲那条命令。'
+                + '一个实例本身有五六个同名进程（主进程、GPU、网络、渲染、host），工具命令的 runner 与我们自己的助手也是同一个 exe —— '
+                + '所以判定「另一个实例」时只认主进程与 host 进程。',
               ),
               h('div', { style: { marginTop: '4px', fontSize: '11.5px' } }, describeAuto(auto && auto.lastAuto)),
               auto && auto.lastMissed
-                ? h('div', { style: { marginTop: '2px', fontSize: '11.5px', color: '#d9534f' } },
-                  `⚠ 上一次退出时自动清理没跑完：为 pid ${auto.lastMissed.waitedPid} 架设的助手`
-                  + `${auto.lastMissed.helperPid ? `（pid ${auto.lastMissed.helperPid}）` : ''}在 `
-                  + `${auto.lastMissed.at || '架设之后'} 之后就消失了，没留下任何报告 —— `
-                  + '它多半是被系统或别的工具一起结束了。再完全退出一次 DSH 就会重试。')
+                ? (() => {
+                  const m = auto.lastMissed
+                  const orphanCount = (value && value.orphanCaches && value.orphanCaches.length) || 0
+                  // 有活可干才值得报警；没活可干时这一轮跳过没有实际影响，用中性灰字说清楚即可。
+                  const hadWork = (value.withEntries ?? 0) > 0 || orphanCount > 0
+                  const seen = m.lastSeenAt ? `最后一次心跳 ${m.lastSeenAt}，` : ''
+                  const head = `上一轮退出窗口里的助手没留下任何报告：为 pid ${m.waitedPid} 架设的助手`
+                    + `${m.helperPid ? `（pid ${m.helperPid}）` : ''}架设于 ${m.at || '未知时间'}，${seen}现已不在。`
+                  return h('div', { style: { marginTop: '2px', fontSize: '11.5px', color: hadWork ? '#d9534f' : 'GrayText' } },
+                    hadWork
+                      ? `⚠ ${head}当前还有待清理的条目，下次**完全退出** DSH 时会自动重试。`
+                      : `${head}当前没有待清理的条目，这一轮跳过没有影响；下次**完全退出** DSH 时会自动重试。`)
+                })()
+                : null,
+              auto && auto.armed
+                ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11px' } },
+                  `本轮记录：助手${auto.armed.helperPid ? ` pid ${auto.armed.helperPid}` : ''} 等 pid ${auto.armed.waitedPid} 退出`
+                  + `（架设于 ${auto.armed.at || '未知'}`
+                  + `${auto.heartbeat && Number(auto.heartbeat.pid) === Number(auto.armed.helperPid) ? `，最后心跳 ${auto.heartbeat.at}` : ''}）`)
                 : null,
               autoFailures(auto && auto.lastAuto).length
                 ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11px' } },
