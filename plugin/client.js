@@ -380,7 +380,7 @@ function registerWithLoader() {
               ),
               h('div', { style: { ...S.muted, marginTop: '3px', fontSize: '11.5px' } },
                 '若退出时还有别的 DSH 实例在跑，助手不会动手（同一份会话存储不能有两个写者），而是**继续等**，'
-                + '等到机器上真的没有 DSH 了再清理；只有等到 12 小时上限仍没等到，才会记一条「本次跳过」。'
+                + '等到机器上真的没有 DSH 了再清理；只有等到 72 小时上限仍没等到，才会记一条「本次跳过」。'
                 + '注意 DSH 应用菜单里的「重启」是 app.relaunch() —— 新实例先起来、旧实例后退出，两者重叠一两秒，'
                 + '这种重启链里不存在「没有实例」的空档，助手会一直等到你**真正关掉** DSH 的那一刻才动手。'
                 + '一个实例本身有五六个同名进程（主进程、GPU、网络、渲染、host），工具命令的 runner 与我们自己的助手也是同一个 exe —— '
@@ -407,7 +407,7 @@ function registerWithLoader() {
                   `本轮记录：助手${auto.armed.helperPid ? ` pid ${auto.armed.helperPid}` : ''} 等 pid ${auto.armed.waitedPid} 退出`
                   + `${auto.armed.mainPid ? `（本实例主进程 pid ${auto.armed.mainPid}）` : ''}`
                   + `（架设于 ${auto.armed.at || '未知'}`
-                  + `${auto.heartbeat && Number(auto.heartbeat.pid) === Number(auto.armed.helperPid) ? `，最后心跳 ${auto.heartbeat.at}` : ''}）`)
+                  + `${auto.heartbeat && Number(auto.heartbeat.pid) === Number(auto.armed.helperPid) ? `，最后心跳 ${auto.heartbeat.at}（${ageText(auto.heartbeat.at)}）` : ''}）`)
                 : null,
               autoFailures(auto && auto.lastAuto).length
                 ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11px' } },

@@ -350,6 +350,33 @@ check('已有一轮更新的助手在等 → 本助手让位',
 check('新一轮的助手已经不在了 → 不让位（留下来当备胎）',
   policyJson.supersededNewHelperDead === false && policyJson.supersededNoArm === false, JSON.stringify(policyJson));
 
+// ---- 6g. 写盘必须原子：写日志/缓存中途被杀也不能留下半截文件 -----------------
+console.log('\n6g) atomicWrite（同目录临时文件 + 改名）');
+const atomicTarget = path.join(HOME, 'tools', 'dsh-agent-clean', 'atomic-probe.txt');
+fs.mkdirSync(path.dirname(atomicTarget), { recursive: true });
+const atomicOut = spawnSync(process.execPath, ['--input-type=module', '-e', `
+  const m = await import(process.env.DSAC_TEST_CLEAN);
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const target = process.env.DSAC_ATOMIC_TARGET;
+  m.atomicWrite(target, Buffer.from([1, 2, 3]));
+  const first = Array.from(fs.readFileSync(target));
+  m.atomicWrite(target, 'second', 'utf8');
+  process.stdout.write(JSON.stringify({
+    first,
+    second: fs.readFileSync(target, 'utf8'),
+    leftovers: fs.readdirSync(path.dirname(target)).filter((n) => n.includes('dsac-write')),
+  }));
+`], { encoding: 'utf8', env: { ...process.env, DSH_HOME: HOME, DSAC_STATE_DIR: STATE, DSAC_TEST_CLEAN: pathToFileURL(CLEAN).href, DSAC_ATOMIC_TARGET: atomicTarget } });
+let atomicJson = {};
+try { atomicJson = JSON.parse(String(atomicOut.stdout || '').trim()); } catch { atomicJson = {}; }
+check('atomicWrite 二进制与文本都原样落盘（内容是新的，不是半截）',
+  JSON.stringify(atomicJson.first) === '[1,2,3]' && atomicJson.second === 'second', `${atomicOut.stdout} ${atomicOut.stderr}`);
+check('atomicWrite 不留临时文件',
+  Array.isArray(atomicJson.leftovers) && atomicJson.leftovers.length === 0, JSON.stringify(atomicJson.leftovers));
+check('dismiss 之后会话目录里也没有临时文件',
+  fs.readdirSync(dirA).every((n) => !n.includes('dsac-write')), fs.readdirSync(dirA).join(' '));
+
 // ---- 7. 可选：真实日志的 dismiss 回归 --------------------------------------
 if (FIXTURE) {
   console.log('\n7) 真实日志 fixture 回归');

@@ -44,7 +44,7 @@
  *
  * 输出同时写入 <状态目录>/out_last.txt（UTF-8），控制台乱码时读它。
  */
-import { readFileSync, writeFileSync, appendFileSync, copyFileSync, mkdirSync, readdirSync, statSync, existsSync, rmSync, openSync, closeSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, copyFileSync, renameSync, mkdirSync, readdirSync, statSync, existsSync, rmSync, openSync, closeSync, realpathSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -333,8 +333,8 @@ function stripOne(s, { apply, force, generations }) {
     manifest.files.push({ backup: 'projcache.json', original: cachePlan[0].path });
   }
   writeFileSync(join(bak, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8');
-  for (const p of plan) { writeFileSync(p.path, p.buf); removedTotal += p.removed; }
-  for (const c of cachePlan) writeFileSync(c.path, c.out, 'utf8');
+  for (const p of plan) { atomicWrite(p.path, p.buf); removedTotal += p.removed; }
+  for (const c of cachePlan) atomicWrite(c.path, c.out, 'utf8');
   for (const p of plan) {
     const check = inspect(readFileSync(p.path), s.cache.inherited ?? 0);
     say(`  复核 ${p.path.split('\\').pop()}: ${check.rows} 行，自己的 catalog ${check.catalog} 条`);
@@ -538,6 +538,15 @@ function cmdDismiss(opts) {
   if (failures) process.exitCode = 1;
 }
 
+/** 同目录「写临时文件 + 改名」：助手若在写盘中途被杀（关机、菜单重启的连带清理、任务管理器结束），
+ *  会话日志只会是「旧的完整版」或「新的完整版」，绝不会留下半截文件。临时文件名刻意不含 session.v，
+ *  免得被会话扫描（只认 /^session\.v\d+\.jsonl(\.zstd)?$/）当成一份代际日志。 */
+function atomicWrite(target, data, encoding) {
+  const tmp = join(dirname(target), 'dsac-write.tmp');
+  writeFileSync(tmp, data, encoding);
+  renameSync(tmp, target);
+}
+
 function dismissOne(s, opts) {
   say(`会话 ${s.sessionId}`);
   say(`  工作区: ${s.projectLabel}   标题: ${s.cache.title || '(未知)'}`);
@@ -597,8 +606,8 @@ function dismissOne(s, opts) {
   manifest.files.push({ backup: logBase, original: s.logPath });
   if (cachePatch.length) { copyFileSync(cachePatch[0].path, join(bak, 'projcache.json')); manifest.files.push({ backup: 'projcache.json', original: cachePatch[0].path }); }
   writeFileSync(join(bak, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8');
-  writeFileSync(s.logPath, r.buf);
-  for (const c of cachePatch) writeFileSync(c.path, c.out, 'utf8');
+  atomicWrite(s.logPath, r.buf);
+  for (const c of cachePatch) atomicWrite(c.path, c.out, 'utf8');
   const after = inspect(readFileSync(s.logPath), inherited);
   say(`  复核(盘上): ${after.rows} 行，自己的 catalog ${after.catalog} 条`);
   const live = verifyWithRealLoader(SESS_ROOT, projectDir, s.sessionId, opts);
@@ -754,7 +763,11 @@ const AUTO_LOCK = join(STATE_DIR, 'auto.lock');
  * 进程树一起消失）。有这份记录，宿主半就能在设置页明说「上一轮没跑完」，而不是静默。
  */
 const AUTO_ARMED = join(STATE_DIR, 'auto-armed.json');
-const AUTO_DEFAULTS = { enabled: true, maxWaitMs: 12 * 60 * 60 * 1000, verify: true, checkOther: true };
+/** maxWaitMs＝助手最多守多久。原先是 12 小时：实测用户可能连着好几天不重启 DSH（auto.log 里
+ *  10-08 到 10-13 一条架设记录都没有），12 小时一到助手就自己走了，那一轮退出窗口反而没人守。
+ *  改成 72 小时；老装机 auto-arm.json 里存的 43200000（正是旧的内置默认值）在 cmdAutoWait 里按
+ *  「没设置过」处理，于是自动升到新默认，不必让用户去改状态文件。 */
+const AUTO_DEFAULTS = { enabled: true, maxWaitMs: 72 * 60 * 60 * 1000, verify: true, checkOther: true };
 
 function readArm() {
   try {
@@ -826,7 +839,7 @@ function writeHeartbeat(waitedPid) {
   } catch { /* 忽略 */ }
 }
 let lastHeartbeatAt = 0;
-/** 最多每分钟落一次盘（等待可能长达 12 小时，不必每秒都写）。 */
+/** 最多每分钟落一次盘（等待可能长达 72 小时，不必每秒都写）。 */
 function heartbeat(waitedPid, force = false) {
   const now = Date.now();
   if (!force && now - lastHeartbeatAt < 60 * 1000) return;
@@ -1047,7 +1060,13 @@ function cmdAutoWaitInner(opts) {
     process.exitCode = 1;
     return;
   }
-  const maxWaitMs = Number.isFinite(Number(arm.maxWaitMs)) && Number(arm.maxWaitMs) > 0 ? Number(arm.maxWaitMs) : AUTO_DEFAULTS.maxWaitMs;
+  // 12 小时（43200000）是 1.3.5 及以前的**内置默认值**，不是用户的选择：老装机 auto-arm.json 里都存着它，
+  // 照读不放的话这些机器永远用不到新的 72 小时。想固定 12 小时的人可以显式写别的值（例如 43199999）。
+  const LEGACY_DEFAULT_MAX_WAIT = 12 * 60 * 60 * 1000;
+  const storedMaxWait = Number(arm.maxWaitMs);
+  const maxWaitMs = Number.isFinite(storedMaxWait) && storedMaxWait > 0 && storedMaxWait !== LEGACY_DEFAULT_MAX_WAIT
+    ? storedMaxWait
+    : AUTO_DEFAULTS.maxWaitMs;
   const t0 = Date.now();
   heartbeat(pid, true);
   autoLog(`自动清理：等 DSH pid=${pid} 退出（上限 ${Math.round(maxWaitMs / 60000)} 分钟）`);
@@ -1252,7 +1271,7 @@ function usage() {
 // 真正的写操作仍只走本文件的 CLI（必须完全退出 DSH）。
 export { DSH_HOME, SESS_ROOT, CACHE_ROOT, STATE_DIR, BACKUP_ROOT, VERSION, CATALOG_TYPE, DISMISS_TYPE };
 export { frameLength, frameTexts, inspect, readCache, listSessions, allSessionIds, emptyCatalogState, rebuildDismiss };
-export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_ARMED, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, readArmed, writeArmed, missedRun, pidAlive, cmdAutoWait };
+export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_ARMED, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, readArmed, writeArmed, missedRun, pidAlive, cmdAutoWait, atomicWrite };
 export { dshProcessIds, otherDshPids, dshProcesses, classifyProcessCmd, otherInstances, fmtInstances, describeOthers, supersededByNewerArm };
 export { AUTO_HEARTBEAT, readHeartbeat, writeHeartbeat };
 

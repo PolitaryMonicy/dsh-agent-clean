@@ -176,12 +176,13 @@ Two more constraints (handled by the tool):
 - **Dry run by default**; with `--apply` every touched file is first copied **in full** to `backups/<ISO>_<command>_<shortid>/` together with a `manifest.json` recording the original paths (used by `restore`).
 - Before writing, the transform is verified on a **mirror** by the **real loader** (the desktop Electron binary running `verify_loader.mjs`); only then are the real files touched. After writing, both the on-disk log and the real loader are re-checked.
 - Recompressed frames use `ZSTD_c_checksumFlag = 1`, matching the original format.
+- **Writes are atomic**: session logs and caches go to a sibling `dsac-write.tmp` first and are then `rename`d over the target. If the helper is killed mid-write (shutdown, the cascade from the app menu's Restart, Task Manager), the disk holds either the complete pre-write file or the complete post-write file — never half a log. The temp name deliberately avoids `session.v`, so the session scanner (which only matches `session.v<digits>.jsonl(.zstd)`) cannot mistake it for a generation log.
 - `orphans` only touches files under `storages/session_projcache/sessions/`.
 - `purge` backs up **all generation logs** (`session.v3/v4…`) plus the cache, then removes the session directory; `restore` recreates it.
 - The auto-clean helper (2.2) is **only ever armed, never in-process**: it waits for the DSH pid to disappear and takes a
   pid-and-timestamp lock so two helpers cannot run at once (if a previous helper is still finishing, this one waits up
   to 3 minutes instead of burning the whole window). If another DSH instance is still running it does **not** give up: it
-  keeps waiting until no DSH instance is left at all (bounded by `maxWaitMs`, 12 h by default) and only then writes a
+  keeps waiting until no DSH instance is left at all (bounded by `maxWaitMs`, 72 h by default) and only then writes a
   "skipped this window" report. **"Another instance" must be decided by command line, not by image name**: one DSH
   instance has five or six same-named processes (Electron main, GPU, network, renderer, host), and the tool runner plus
   the helper itself run the same exe — counting by image name turned **one** instance into five in a real report. So only
@@ -218,7 +219,7 @@ Two more constraints (handled by the tool):
 
 ## 6. How correctness is proven
 
-- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **54/54 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners and must not call the current instance's own main process "another instance", a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, the rule that a heartbeat is only trusted when it belongs to that very helper, and the restart-chain hand-over rule: an older helper yields **only** while the newer helper is alive, and stays as a fallback once it is gone); **57/57 pass** with a real-log fixture (section below).
+- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **57/57 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners and must not call the current instance's own main process "another instance", a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, the rule that a heartbeat is only trusted when it belongs to that very helper, the restart-chain hand-over rule: an older helper yields **only** while the newer helper is alive, and stays as a fallback once it is gone, and write atomicity: bytes land verbatim, no temp file survives, and a dismiss leaves no leftovers in the session directory); **60/60 pass** with a real-log fixture (section below).
 - **Offline probes** for the two plugin halves (no DSH, no writes to session storage):
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS` — fakes `window.__ModuleLoader__` and a minimal React
     to prove the settings slot is registered exactly once, that a late `slots` service is still picked up through
