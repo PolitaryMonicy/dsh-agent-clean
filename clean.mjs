@@ -970,6 +970,28 @@ function otherDshPids(waitedPid, ids = dshProcessIds()) {
   if (Number.isInteger(waited) && waited > 0) skip.add(waited);
   return ids.map(Number).filter((id) => Number.isInteger(id) && id > 0 && !skip.has(id));
 }
+/**
+ * 「另见的是不是我们自己那个实例」——只影响措辞，不影响「能不能动手」的判定。
+ * `auto-armed.json` 里记了本轮助手所属**主进程**的 pid（宿主进程的父进程），于是能分清
+ * 「同一个 DSH 还没退完」（退出慢、或 host 被主进程重启过）与「真的还有第二个实例」。
+ */
+function describeOthers(others, ownMainPid) {
+  const own = Number(ownMainPid);
+  const mine = Number.isInteger(own) && own > 0 && others.some((o) => Number(o.pid) === own);
+  return `${mine ? '同一个 DSH 实例还没退完' : '另一个 DSH 实例'}（${fmtInstances(others)}）`;
+}
+/**
+ * 是不是已经被「更新的一轮」接手了：`auto-armed.json` 指向另一个被等的 pid、而它的助手还活着。
+ * 每次启动都会覆盖这份记录，所以记录里永远是**最新**那一轮；旧助手这时该让位退出 ——
+ * 新一轮的助手会在真正的退出窗口动手，而且清理的是同一批会话，不会漏活。
+ * 若那个新助手已经不在（崩了/被杀），返回 false：旧助手留下来当备胎。
+ */
+function supersededByNewerArm(waitedPid) {
+  const armed = readArmed();
+  if (!armed) return false;
+  if (Number(armed.waitedPid) === Number(waitedPid)) return false;
+  return pidAlive(armed.helperPid);
+}
 /** 独占认领：同一次启动被重复架设、或多个实例并存时，只有一个助手动手。 */
 function claimLock() {
   const now = Date.now();
@@ -1064,26 +1086,77 @@ function cmdAutoWaitInner(opts) {
     return;
   }
   if (arm.checkOther !== false) {
-    // 主进程刚退出时，它的 GPU/渲染子进程可能还残留一两秒 —— 宽限重判，别把这种残留当成「另一个实例」。
-    // 注意其它角色（子进程、runner、助手）**不参与判定**：一个实例有五六个同名进程，
+    // 1.3.4 在这里是「宽限 10 秒，还看见实例就跳过」，实测结果是**每次都跳过**：
+    // 用户若用 DSH 应用菜单里的「重启」，那个动作是 `app.relaunch(); quitWithoutConfirmation()`
+    // （见 app.asar 里的 restart／restartAppHostMenu）—— 新实例先起来、旧实例后退出，
+    // 两个实例重叠一两秒；等旧 host 死了再看，新实例的主进程与 host 早就在跑了，
+    // 「另一个实例仍在运行」于是永远成立，一整轮退出窗口白丢。
+    // 现在改成有耐心地等：只要还有实例级进程（主进程/host）就持续重判（受 maxWaitMs 约束），
+    // 一直等到**真的没有任何 DSH 在跑**为止；若这一轮已被更新的助手接手，就让位退出。
+    // 注意其它角色（GPU/渲染子进程、runner、助手）**不参与判定**：一个实例有五六个同名进程，
     // 全算上就会在「用户已经重新打开 DSH」之外的任何残留里误报（见 otherInstances 的注释）。
+    const ownMainPid = Number(readArmed()?.mainPid) || 0;
+    const waitedFrom = Date.now();
     let others = otherInstances(pid);
-    for (let i = 0; i < 10 && others.length; i++) {
-      autoLog(`自动清理：另见 DSH 实例进程 ${fmtInstances(others)}，1 秒后重判（${i + 1}/10）`);
+    let quiet = 0;
+    let lastKey = '';
+    let lastLogAt = 0;
+    for (let i = 0; ; i++) {
+      const now = Date.now();
+      if (!others.length) {
+        // 「零实例」也可能只是一个几秒的空档（关掉后马上又点开）：清理一次要几十秒，
+        // 若中途新实例的 host 打开了会话存储，就正好撞上我们写盘 —— 连续确认几轮再动手。
+        if (quiet >= 3) break;
+        quiet += 1;
+        if (quiet === 1) autoLog('自动清理：此刻没有 DSH 实例在跑，连续确认 3 轮后动手');
+      } else {
+        quiet = 0;
+        const key = others.map((o) => `${o.role}:${o.pid}`).sort().join(',');
+        // 只在「看到的进程变了」或每隔 5 分钟记一行：菜单重启会来回好几轮，逐秒刷日志没人看得下去。
+        if (key !== lastKey || now - lastLogAt > 5 * 60 * 1000) {
+          autoLog(`自动清理：pid=${pid} 已退出，但${describeOthers(others, ownMainPid)}；先等它退出（已等 ${Math.round((now - waitedFrom) / 1000)} 秒）`);
+          lastKey = key;
+          lastLogAt = now;
+        }
+      }
       heartbeat(pid);
-      sleepSync(1000);
+      if (i % 5 === 0) {
+        if (readArm().enabled !== true) {
+          autoLog('自动清理：等待期间开关被关掉，退出');
+          writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'disabled' });
+          say('自动清理：开关已关闭，退出。');
+          emit();
+          return;
+        }
+        if (supersededByNewerArm(pid)) {
+          autoLog('自动清理：这一轮已被更新的助手接手（它会在下一个真正的退出窗口动手），本助手退出');
+          emit();
+          return;
+        }
+      }
+      if (now - t0 > maxWaitMs) {
+        const pids = others.map((o) => o.pid);
+        const minutes = Math.round(maxWaitMs / 60000);
+        if (others.length) {
+          autoLog(`自动清理：${describeOthers(others, ownMainPid)}，等到 ${minutes} 分钟上限仍未彻底退出，跳过`);
+          writeAutoReport({
+            at: new Date().toISOString(), ran: false, why: 'other-dsh-running',
+            waitedPid: pid, otherPids: pids, otherRoles: others,
+            ownMainPid: ownMainPid || null,
+            sameInstance: ownMainPid > 0 && pids.includes(ownMainPid),
+            waitedMs: now - waitedFrom,
+          });
+          say(`自动清理：${describeOthers(others, ownMainPid)}，本次跳过（下一个退出窗口再来）。`);
+        } else {
+          autoLog(`自动清理：等待 DSH 彻底退出超时（${minutes} 分钟），跳过`);
+          writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'timeout', waitedPid: pid, waitedMs: now - t0 });
+          say('自动清理：等待 DSH 退出超时，未做任何改动。');
+        }
+        emit();
+        return;
+      }
+      sleepSync(others.length ? 2000 : 1500);
       others = otherInstances(pid);
-    }
-    if (others.length) {
-      const pids = others.map((o) => o.pid);
-      autoLog(`自动清理：检测到另一个 DSH 实例仍在运行（${fmtInstances(others)}），跳过（下次退出时再来）`);
-      writeAutoReport({
-        at: new Date().toISOString(), ran: false, why: 'other-dsh-running',
-        waitedPid: pid, otherPids: pids, otherRoles: others,
-      });
-      say(`自动清理：检测到另一个 DSH 实例仍在运行（${fmtInstances(others)}），本次跳过。`);
-      emit();
-      return;
     }
   }
   const startedAt = new Date();
@@ -1180,7 +1253,7 @@ function usage() {
 export { DSH_HOME, SESS_ROOT, CACHE_ROOT, STATE_DIR, BACKUP_ROOT, VERSION, CATALOG_TYPE, DISMISS_TYPE };
 export { frameLength, frameTexts, inspect, readCache, listSessions, allSessionIds, emptyCatalogState, rebuildDismiss };
 export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_ARMED, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, readArmed, writeArmed, missedRun, pidAlive, cmdAutoWait };
-export { dshProcessIds, otherDshPids, dshProcesses, classifyProcessCmd, otherInstances, fmtInstances };
+export { dshProcessIds, otherDshPids, dshProcesses, classifyProcessCmd, otherInstances, fmtInstances, describeOthers, supersededByNewerArm };
 export { AUTO_HEARTBEAT, readHeartbeat, writeHeartbeat };
 
 /** 只有被 `node clean.mjs …`（或包装脚本）直接调用时才跑 CLI；被插件 import 时只导出、不执行。 */

@@ -311,6 +311,45 @@ check('「另一个实例」只数主进程与 host（排除子进程、助手�
   JSON.stringify(roleJson.others) === '[{"pid":1,"role":"main"}]', JSON.stringify(roleJson.others));
 check('实例描述写成「主进程 1」', roleJson.text === '主进程 1', String(roleJson.text));
 
+// ---- 6f. 重启链里不能让出退出窗口：措辞与让位 ------------------------------
+console.log('\n6f) describeOthers / supersededByNewerArm（重启链里别每次都跳过）');
+// 实测（用户 2026-10-13 的 auto.log）：DSH 应用菜单的「重启」＝ `app.relaunch(); quitWithoutConfirmation()`
+// —— 新实例先起来、旧实例后退出，两者重叠一两秒。1.3.4 的助手宽限 10 秒后看见新实例就跳过，
+// 于是**每一次重启都跳过**，一整轮退出窗口白丢。现在改成一直等到真的没有实例为止，
+// 只有「被更新的一轮接手」时才让位退出（新一轮助手会在真正的退出窗口动手，且清理同一批会话）。
+const policyProbe = spawnSync(process.execPath, ['--input-type=module', '-e', `
+const m = await import(process.env.DSAC_TEST_CLEAN);
+const fs = await import('node:fs');
+const path = await import('node:path');
+const armedFile = path.join(process.env.DSAC_STATE_DIR, 'auto-armed.json');
+const setArmed = (rec) => { if (rec) fs.writeFileSync(armedFile, JSON.stringify(rec), 'utf8'); else fs.rmSync(armedFile, { force: true }); };
+const out = {
+  foreign: m.describeOthers([{ pid: 6840, role: 'main' }, { pid: 10596, role: 'host' }], 17472),
+  mine: m.describeOthers([{ pid: 17472, role: 'main' }], 17472),
+  noMain: m.describeOthers([{ pid: 5, role: 'host' }], 0),
+};
+setArmed({ waitedPid: 111, helperPid: process.pid, mainPid: process.ppid, at: new Date().toISOString() });
+out.supersededOtherPidLive = m.supersededByNewerArm(222);
+out.supersededSamePid = m.supersededByNewerArm(111);
+setArmed({ waitedPid: 111, helperPid: 999999, at: new Date().toISOString() });
+out.supersededNewHelperDead = m.supersededByNewerArm(222);
+setArmed(null);
+out.supersededNoArm = m.supersededByNewerArm(222);
+process.stdout.write(JSON.stringify(out));
+`], { encoding: 'utf8', env: { ...process.env, DSH_HOME: HOME, DSAC_STATE_DIR: STATE, DSAC_TEST_CLEAN: pathToFileURL(CLEAN).href } });
+let policyJson = {};
+try { policyJson = JSON.parse(String(policyProbe.stdout || '').trim()); } catch { policyJson = {}; }
+check('另见的是别的实例 → 说「另一个 DSH 实例」',
+  String(policyJson.foreign).startsWith('另一个 DSH 实例（主进程 6840、host 进程 10596）'), String(policyJson.foreign));
+check('另见的正是本实例的主进程 → 说「同一个 DSH 实例还没退完」',
+  String(policyJson.mine).startsWith('同一个 DSH 实例还没退完'), String(policyJson.mine));
+check('没记下主进程 pid 时按「另一个实例」说（不瞎猜）',
+  String(policyJson.noMain).startsWith('另一个 DSH 实例'), String(policyJson.noMain));
+check('已有一轮更新的助手在等 → 本助手让位',
+  policyJson.supersededOtherPidLive === true && policyJson.supersededSamePid === false, JSON.stringify(policyJson));
+check('新一轮的助手已经不在了 → 不让位（留下来当备胎）',
+  policyJson.supersededNewHelperDead === false && policyJson.supersededNoArm === false, JSON.stringify(policyJson));
+
 // ---- 7. 可选：真实日志的 dismiss 回归 --------------------------------------
 if (FIXTURE) {
   console.log('\n7) 真实日志 fixture 回归');

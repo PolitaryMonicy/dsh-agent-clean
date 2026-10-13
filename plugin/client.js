@@ -193,8 +193,22 @@ function registerWithLoader() {
 
     /** 「上次自动清理」的一句话说明。 */
     const ROLE_ZH = { main: '主进程', host: 'host 进程', other: '进程' }
+    /** 把时间戳说成人话（「3 天前」）—— 报告可能是好几天前的，只给 ISO 时间根本看不出来。 */
+    function ageText(iso) {
+      const t = Date.parse(String(iso ?? ''))
+      if (!Number.isFinite(t)) return ''
+      const mins = Math.round((Date.now() - t) / 60000)
+      if (mins < 1) return '刚刚'
+      if (mins < 60) return `${mins} 分钟前`
+      const hours = Math.round(mins / 60)
+      if (hours < 24) return `${hours} 小时前`
+      const days = Math.round(hours / 24)
+      return days < 30 ? `${days} 天前` : `${Math.round(days / 30)} 个月前`
+    }
     function describeAuto(report) {
       if (!report) return '还没有自动清理的记录（助手只在你完全退出 DSH 之后动手）。'
+      const age = ageText(report.at)
+      const stamp = report.at ? `${report.at}${age ? `，${age}` : ''}` : '时间未知'
       const why = {
         timeout: '等待 DSH 退出超时，未做任何改动',
         disabled: '开关是关闭的，未做任何改动',
@@ -205,12 +219,14 @@ function registerWithLoader() {
           const parts = Array.isArray(report.otherRoles) && report.otherRoles.length
             ? report.otherRoles.map((o) => `${ROLE_ZH[o.role] ?? o.role} ${o.pid}`).join('、')
             : (Array.isArray(report.otherPids) && report.otherPids.length ? `pid ${report.otherPids.join('、')}` : '')
-          return parts ? `检测到另一个 DSH 实例仍在运行（${parts}），本次跳过` : '检测到另一个 DSH 实例仍在运行，本次跳过'
+          const what = report.sameInstance === true ? '同一个 DSH 实例还没退完' : '检测到另一个 DSH 实例仍在运行'
+          const waited = Number(report.waitedMs) > 0 ? `（一直等到 ${Math.round(Number(report.waitedMs) / 60000)} 分钟上限）` : ''
+          return `${what}${parts ? `（${parts}）` : ''}${waited}，本次跳过`
         })(),
       }[report.why] || report.why || '未执行'
-      if (report.ran !== true) return `上次未执行：${why}（${report.at || '时间未知'}）`
+      if (report.ran !== true) return `上次未执行：${why}（${stamp}）`
       const backups = Array.isArray(report.backups) ? report.backups.length : 0
-      return `上次自动清理：${report.at}，处理 ${report.sessions ?? '?'} 个会话，改写 ${report.cleaned ?? '?'} 个，`
+      return `上次自动清理：${stamp}，处理 ${report.sessions ?? '?'} 个会话，改写 ${report.cleaned ?? '?'} 个，`
         + `失败 ${report.failures ?? '?'} 个${backups ? `，备份 ${backups} 份` : ''}`
     }
 
@@ -363,8 +379,10 @@ function registerWithLoader() {
                 + '所以你什么都不用敲，下次启动时界面里就已经没有条目了。',
               ),
               h('div', { style: { ...S.muted, marginTop: '3px', fontSize: '11.5px' } },
-                '若退出时还有第二个 DSH 实例在跑，助手会跳过本次（下一个退出窗口再来）；'
-                + '助手只在看到 DSH 进程真的消失后才动盘，动作等价于你自己敲那条命令。'
+                '若退出时还有别的 DSH 实例在跑，助手不会动手（同一份会话存储不能有两个写者），而是**继续等**，'
+                + '等到机器上真的没有 DSH 了再清理；只有等到 12 小时上限仍没等到，才会记一条「本次跳过」。'
+                + '注意 DSH 应用菜单里的「重启」是 app.relaunch() —— 新实例先起来、旧实例后退出，两者重叠一两秒，'
+                + '这种重启链里不存在「没有实例」的空档，助手会一直等到你**真正关掉** DSH 的那一刻才动手。'
                 + '一个实例本身有五六个同名进程（主进程、GPU、网络、渲染、host），工具命令的 runner 与我们自己的助手也是同一个 exe —— '
                 + '所以判定「另一个实例」时只认主进程与 host 进程。',
               ),
@@ -387,6 +405,7 @@ function registerWithLoader() {
               auto && auto.armed
                 ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11px' } },
                   `本轮记录：助手${auto.armed.helperPid ? ` pid ${auto.armed.helperPid}` : ''} 等 pid ${auto.armed.waitedPid} 退出`
+                  + `${auto.armed.mainPid ? `（本实例主进程 pid ${auto.armed.mainPid}）` : ''}`
                   + `（架设于 ${auto.armed.at || '未知'}`
                   + `${auto.heartbeat && Number(auto.heartbeat.pid) === Number(auto.armed.helperPid) ? `，最后心跳 ${auto.heartbeat.at}` : ''}）`)
                 : null,

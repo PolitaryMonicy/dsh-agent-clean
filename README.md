@@ -178,18 +178,26 @@ Two more constraints (handled by the tool):
 - Recompressed frames use `ZSTD_c_checksumFlag = 1`, matching the original format.
 - `orphans` only touches files under `storages/session_projcache/sessions/`.
 - `purge` backs up **all generation logs** (`session.v3/v4…`) plus the cache, then removes the session directory; `restore` recreates it.
-- The auto-clean helper (2.2) is **only ever armed, never in-process**: it waits for the DSH pid to disappear, takes a
+- The auto-clean helper (2.2) is **only ever armed, never in-process**: it waits for the DSH pid to disappear and takes a
   pid-and-timestamp lock so two helpers cannot run at once (if a previous helper is still finishing, this one waits up
-  to 3 minutes instead of burning the whole window), and skips the window entirely if another DSH instance is still
-  running. **"Another instance" must be decided by command line, not by image name**: one DSH instance has five or six
-  same-named processes (Electron main, GPU, network, renderer, host), and the tool runner plus the helper itself run the
-  same exe — counting by image name turned **one** instance into five in a real report. So only the **main process and
-  the host process** (owner of the session store, which is also the pid being waited for) count as an instance; the
-  helper itself, the waited pid, Electron children and runners never do (leftover children get a 10-second grace). It
-  then goes through exactly the same backup → mirror self-check → real-loader verification path as
-  `dismiss --all --apply`. A switch turned off mid-session needs no kill: the waiting helper re-reads `auto-arm.json`
-  and exits untouched, and a restarted host process will not arm a second helper while the previous one still waits for
-  the same pid.
+  to 3 minutes instead of burning the whole window). If another DSH instance is still running it does **not** give up: it
+  keeps waiting until no DSH instance is left at all (bounded by `maxWaitMs`, 12 h by default) and only then writes a
+  "skipped this window" report. **"Another instance" must be decided by command line, not by image name**: one DSH
+  instance has five or six same-named processes (Electron main, GPU, network, renderer, host), and the tool runner plus
+  the helper itself run the same exe — counting by image name turned **one** instance into five in a real report. So only
+  the **main process and the host process** (owner of the session store, which is also the pid being waited for) count as
+  an instance; the helper itself, the waited pid, Electron children and runners never do. A "zero instances" moment is
+  confirmed over three consecutive rounds (≈4.5 s) before anything is touched: a clean run takes tens of seconds, and a
+  new instance's host opening the session store mid-write is exactly what must not happen. It then goes through exactly
+  the same backup → mirror self-check → real-loader verification path as `dismiss --all --apply`. A switch turned off
+  mid-session needs no kill: the waiting helper re-reads `auto-arm.json` and exits untouched, and a restarted host
+  process will not arm a second helper while the previous one still waits for the same pid. When a **newer round** has
+  taken over (`auto-armed.json` names a different waited pid and its helper is alive), the older helper yields and exits
+  — the newer one acts in the real exit window and cleans the same sessions, so no work is lost.
+  (Measured lesson: the "Restart" item in DSH's app menu is `app.relaunch(); quitWithoutConfirmation()` — the new
+  instance starts first and the old one exits afterwards, so the two overlap for a second or two; a 10-second grace
+  followed by a skip therefore skipped **every single restart** and lost the whole exit window. Such a restart chain has
+  no "zero instances" moment at all, so the real cleanup happens when you **fully close** DSH.)
 - **A silent no-show must be visible**: every time the host half arms the helper it records what is waiting for what in
   `auto-armed.json`, and while waiting the helper writes "last seen alive" to `auto-heartbeat.json` every 60 seconds. On
   the next start, if that helper is gone and no report is newer than the arming record, the settings page says so — and
@@ -210,7 +218,7 @@ Two more constraints (handled by the tool):
 
 ## 6. How correctness is proven
 
-- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **49/49 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners, a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, and the rule that a heartbeat is only trusted when it belongs to that very helper); **52/52 pass** with a real-log fixture (section below).
+- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **54/54 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners and must not call the current instance's own main process "another instance", a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, the rule that a heartbeat is only trusted when it belongs to that very helper, and the restart-chain hand-over rule: an older helper yields **only** while the newer helper is alive, and stays as a fallback once it is gone); **57/57 pass** with a real-log fixture (section below).
 - **Offline probes** for the two plugin halves (no DSH, no writes to session storage):
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS` — fakes `window.__ModuleLoader__` and a minimal React
     to prove the settings slot is registered exactly once, that a late `slots` service is still picked up through

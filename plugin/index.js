@@ -258,7 +258,9 @@ function armHelper(reason) {
     })
     child.unref()
     // 记下「本轮是谁在等谁」：助手若在退出窗口里被杀，下次启动就能据此提示「上一轮没跑完」。
-    writeArmed({ waitedPid: process.pid, helperPid: child.pid ?? null, at: new Date().toISOString(), version: VERSION })
+    // `mainPid` 是本宿主进程的父进程（Electron 主进程）：面板据此分清「同一个 DSH 还没退完」
+    // 与「真的还有第二个实例」（见 clean.mjs 的 describeOthers）。
+    writeArmed({ waitedPid: process.pid, helperPid: child.pid ?? null, mainPid: process.ppid ?? null, at: new Date().toISOString(), version: VERSION })
     helperArmed = true
     console.info(`[dsh-agent-clean] auto-clean helper armed for pid ${process.pid} (${reason})`)
     trace(`auto-clean helper armed for pid ${process.pid} (${reason})`)
