@@ -225,6 +225,17 @@ function registerWithLoader() {
         })(),
       }[report.why] || report.why || '未执行'
       if (report.ran !== true) return `上次未执行：${why}（${stamp}）`
+      // 「做了一半」：清理期间新的 DSH 实例起来了，助手当场停手（安全优先，剩下的留给下一次）。
+      if (report.aborted === 'new-instance') {
+        const processed = Number(report.processed ?? 0)
+        const total = Number(report.sessions ?? 0)
+        const parts = Array.isArray(report.otherRoles) && report.otherRoles.length
+          ? report.otherRoles.map((o) => `${ROLE_ZH[o.role] ?? o.role} ${o.pid}`).join('、')
+          : (Array.isArray(report.otherPids) && report.otherPids.length ? `pid ${report.otherPids.join('、')}` : '')
+        return `上次自动清理只做了一半：处理到 ${processed}／${total} 个会话时，新的 DSH 实例`
+          + `${parts ? `（${parts}）` : ''}已经起来了，助手当场停手`
+          + `${processed > 0 ? `（已改写 ${report.cleaned ?? 0} 个）` : '（一个都没改）'}（${stamp}）`
+      }
       const backups = Array.isArray(report.backups) ? report.backups.length : 0
       return `上次自动清理：${stamp}，处理 ${report.sessions ?? '?'} 个会话，改写 ${report.cleaned ?? '?'} 个，`
         + `失败 ${report.failures ?? '?'} 个${backups ? `，备份 ${backups} 份` : ''}`
@@ -386,6 +397,13 @@ function registerWithLoader() {
                 + '一个实例本身有五六个同名进程（主进程、GPU、网络、渲染、host），工具命令的 runner 与我们自己的助手也是同一个 exe —— '
                 + '所以判定「另一个实例」时只认主进程与 host 进程。',
               ),
+              h('div', { style: { marginTop: '3px', fontSize: '11.5px', color: '#b8860b' } },
+                '想让自动清理真的跑一次：把 DSH **完全退出**（关窗口不算 —— 它可能会问你是否退到后台），'
+                + '等一两分钟让助手做完（这段「上次自动清理」会刷新成这一次的结果），再打开。'
+                + '原因是清理一个会话要几十秒，而「关掉就马上重开」两次启动之间只有一两秒空档：'
+                + '助手要连续确认几轮才敢动手，一旦发现新实例已经起来就停手，把剩下的留给下一次。'
+                + '也可以完全退出 DSH 之后，直接照下面那条命令手动跑一次。',
+              ),
               h('div', { style: { marginTop: '4px', fontSize: '11.5px' } }, describeAuto(auto && auto.lastAuto)),
               auto && auto.lastMissed
                 ? (() => {
@@ -395,7 +413,8 @@ function registerWithLoader() {
                   const hadWork = (value.withEntries ?? 0) > 0 || orphanCount > 0
                   const seen = m.lastSeenAt ? `最后一次心跳 ${m.lastSeenAt}，` : ''
                   const head = `上一轮退出窗口里的助手没留下任何报告：为 pid ${m.waitedPid} 架设的助手`
-                    + `${m.helperPid ? `（pid ${m.helperPid}）` : ''}架设于 ${m.at || '未知时间'}，${seen}现已不在。`
+                    + `${m.helperPid ? `（pid ${m.helperPid}）` : ''}架设于 ${m.at || '未知时间'}，${seen}现已不在`
+                    + '（纯 JS 异常一定会留下 helper-crash 报告，所以没有报告多半是它被外力结束：关机、任务管理器，或被连带杀掉）'
                   return h('div', { style: { marginTop: '2px', fontSize: '11.5px', color: hadWork ? '#d9534f' : 'GrayText' } },
                     hadWork
                       ? `⚠ ${head}当前还有待清理的条目，下次**完全退出** DSH 时会自动重试。`
@@ -408,6 +427,12 @@ function registerWithLoader() {
                   + `${auto.armed.mainPid ? `（本实例主进程 pid ${auto.armed.mainPid}）` : ''}`
                   + `（架设于 ${auto.armed.at || '未知'}`
                   + `${auto.heartbeat && Number(auto.heartbeat.pid) === Number(auto.armed.helperPid) ? `，最后心跳 ${auto.heartbeat.at}（${ageText(auto.heartbeat.at)}）` : ''}）`)
+                : null,
+              auto && Array.isArray(auto.logTail) && auto.logTail.length
+                ? h('details', { style: { marginTop: '4px', fontSize: '11px' } },
+                  h('summary', { style: { ...S.muted, cursor: 'pointer' } }, '助手日志最后几行（出问题时看这里：它停在哪一步）'),
+                  h('div', { style: { ...S.code, marginTop: '3px', whiteSpace: 'pre-wrap', fontSize: '10.5px' } },
+                    auto.logTail.join('\n')))
                 : null,
               autoFailures(auto && auto.lastAuto).length
                 ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11px' } },

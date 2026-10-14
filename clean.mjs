@@ -44,7 +44,7 @@
  *
  * 输出同时写入 <状态目录>/out_last.txt（UTF-8），控制台乱码时读它。
  */
-import { readFileSync, writeFileSync, appendFileSync, copyFileSync, renameSync, mkdirSync, readdirSync, statSync, existsSync, rmSync, openSync, closeSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, copyFileSync, renameSync, unlinkSync, mkdirSync, readdirSync, statSync, existsSync, rmSync, openSync, closeSync, realpathSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -801,6 +801,17 @@ function writeAutoReport(report) {
 function autoLog(line) {
   try { appendFileSync(AUTO_LOG, `[${new Date().toISOString()}] ${line}\n`, 'utf8'); } catch { /* 忽略 */ }
 }
+/**
+ * 日志末尾 n 行：给设置页一个小窗口看「助手自己说了什么」。
+ * 以前面板只会说「上一轮没留下报告」，用户与我们只能靠翻文件；把最后几行摆出来，
+ * 下次再出问题，在面板上就能看出它停在哪一步。
+ */
+function readAutoLogTail(n = 8) {
+  try {
+    const lines = readFileSync(AUTO_LOG, 'utf8').replace(/^\uFEFF/, '').split('\n').filter((l) => l.trim());
+    return lines.slice(-Math.max(1, Math.min(50, Number(n) || 8)));
+  } catch { return []; }
+}
 function readArmed() {
   try {
     const raw = readFileSync(AUTO_ARMED, 'utf8').replace(/^\uFEFF/, '');
@@ -1014,6 +1025,18 @@ function claimLock() {
   } catch { /* 无锁或读不出 → 可认领 */ }
   try { writeFileSync(AUTO_LOCK, JSON.stringify({ pid: process.pid, at: now }) + '\n', 'utf8'); return true; } catch { return false; }
 }
+/**
+ * 退出前把锁交还。为什么需要：让位/开关关掉/跳过这几条路以前直接 return，锁留在盘上，
+ * 下一次启动的助手要空等 3 分钟才发现那把锁的主人是死的（claimLock 虽然会接管死锁，
+ * 但接管前那 3 分钟是白等的）。只删自己写的锁，别人的锁不动。
+ */
+function releaseLock() {
+  try {
+    const j = JSON.parse(readFileSync(AUTO_LOCK, 'utf8'));
+    if (j && Number(j.pid) !== process.pid) return;
+  } catch { /* 读不出（无锁/坏文件）也继续删 */ }
+  try { unlinkSync(AUTO_LOCK); } catch { /* 忽略 */ }
+}
 
 /**
  * 助手的外壳：任何未预料到的异常都要落成一份报告 + 一行日志，绝不静默消失。
@@ -1089,6 +1112,7 @@ function cmdAutoWaitInner(opts) {
       autoLog('自动清理：等锁期间开关被关掉，退出');
       writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'disabled' });
       say('自动清理：开关已关闭，退出。');
+      releaseLock();
       emit();
       return;
     }
@@ -1104,6 +1128,8 @@ function cmdAutoWaitInner(opts) {
     emit();
     return;
   }
+  // 本实例主进程（架设时由 host 记下的父进程）：用来把「同一个实例还没退完」与「另一个实例」分开说清。
+  const ownMainPid = Number(readArmed()?.mainPid) || 0;
   if (arm.checkOther !== false) {
     // 1.3.4 在这里是「宽限 10 秒，还看见实例就跳过」，实测结果是**每次都跳过**：
     // 用户若用 DSH 应用菜单里的「重启」，那个动作是 `app.relaunch(); quitWithoutConfirmation()`
@@ -1114,7 +1140,6 @@ function cmdAutoWaitInner(opts) {
     // 一直等到**真的没有任何 DSH 在跑**为止；若这一轮已被更新的助手接手，就让位退出。
     // 注意其它角色（GPU/渲染子进程、runner、助手）**不参与判定**：一个实例有五六个同名进程，
     // 全算上就会在「用户已经重新打开 DSH」之外的任何残留里误报（见 otherInstances 的注释）。
-    const ownMainPid = Number(readArmed()?.mainPid) || 0;
     const waitedFrom = Date.now();
     let others = otherInstances(pid);
     let quiet = 0;
@@ -1144,11 +1169,13 @@ function cmdAutoWaitInner(opts) {
           autoLog('自动清理：等待期间开关被关掉，退出');
           writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'disabled' });
           say('自动清理：开关已关闭，退出。');
+          releaseLock();
           emit();
           return;
         }
         if (supersededByNewerArm(pid)) {
           autoLog('自动清理：这一轮已被更新的助手接手（它会在下一个真正的退出窗口动手），本助手退出');
+          releaseLock();
           emit();
           return;
         }
@@ -1171,6 +1198,7 @@ function cmdAutoWaitInner(opts) {
           writeAutoReport({ at: new Date().toISOString(), ran: false, why: 'timeout', waitedPid: pid, waitedMs: now - t0 });
           say('自动清理：等待 DSH 退出超时，未做任何改动。');
         }
+        releaseLock();
         emit();
         return;
       }
@@ -1199,19 +1227,36 @@ function cmdAutoWaitInner(opts) {
   }
   const targets = all.filter((s) => s.catalog > 0 || (s.cache.catalogCount ?? 0) > 0);
   say(`自动清理：DSH (pid ${pid}) 已退出，开始处理 ${targets.length} 个会话（${fmtTime(startedAt)}）`);
+  // 从这里起每一步都要落进 auto.log：detached 助手的 stdio 是 'ignore'，say() 全丢进虚空。
+  // 1.3.6 及以前「动手」与「完成」之间一行日志都没有，助手若在这中间被杀，事后完全看不出它做到哪一步。
+  autoLog(`自动清理：开始动手，待处理 ${targets.length} 个会话（等锁与判实例共花 ${Math.round((Date.now() - t0) / 1000)} 秒）`);
   if (!targets.length) {
     say('自动清理：没有需要处理的会话。');
     writeAutoReport({ at: startedAt.toISOString(), ran: true, pid, sessions: 0, cleaned: 0, failures: 0, results: [], durationMs: Date.now() - t0 });
     autoLog('自动清理：没有需要处理的会话');
     emit();
+    releaseLock();
     return;
   }
   const app = findApp(useOpts);
   const modules = findModules(useOpts);
   say(`自动清理：真实加载器复核途径 ${app ? `可用（${app.asar}）` : modules ? `可用（${modules}）` : '不可用（未加 --no-verify 将拒绝写入）'}`);
   const results = [];
-  for (const s of targets) {
+  let stopped = null;
+  for (const [index, s] of targets.entries()) {
     heartbeat(pid);
+    // 每个会话之前重判一次实例：用户「关掉就马上重开」时，新实例会在几秒内起来并可能打开会话存储，
+    // 这时继续重写就是在改别人正在读的文件。宁可不做，也不做半个：已改的保留，剩下的留给下一次。
+    // 与前面那道闸同源：arm.checkOther === false 表示用户明确要求「不管别的实例」，那就一路做到底。
+    try {
+      const fresh = arm.checkOther === false ? [] : otherInstances(pid);
+      if (fresh.length) {
+        stopped = fresh;
+        autoLog(`自动清理：处理到第 ${index + 1}／${targets.length} 个会话时发现${describeOthers(fresh, ownMainPid)}，立即停手（已改的保留，剩下的留给下一次）`);
+        break;
+      }
+    } catch { /* 查不出来就照常继续：不因为一次查询失败而放弃整轮 */ }
+    autoLog(`自动清理：处理第 ${index + 1}／${targets.length} 个会话 ${s.sessionId}（${Math.round((s.size ?? 0) / 1024)} KB）`);
     // 单个会话炸掉不该把整轮带走：记成「这一个失败」，其它会话继续。
     let r;
     try {
@@ -1220,18 +1265,33 @@ function cmdAutoWaitInner(opts) {
       r = { ok: false, changed: 0, backup: null, why: `抛出异常：${String((error && error.message) || error).split('\n')[0]}` };
     }
     if (r.ok !== true) autoLog(`自动清理：${s.sessionId} 未处理 —— ${r.why ?? '未知原因'}`);
+    else autoLog(`自动清理：${s.sessionId} ${r.changed > 0 ? `改写 ${r.changed} 条` : '无需改写'}${r.backup ? '，已备份' : ''}`);
     results.push({ sessionId: s.sessionId, ok: r.ok === true, changed: r.changed ?? 0, backup: r.backup ?? null, why: r.why ?? null });
   }
   const cleaned = results.filter((r) => r.changed > 0).length;
   const failures = results.filter((r) => !r.ok).length;
-  writeAutoReport({
+  const report = {
     at: startedAt.toISOString(), ran: true, pid, verify: arm.verify !== false,
-    sessions: targets.length, cleaned, failures,
+    sessions: targets.length, processed: results.length, cleaned, failures,
     backups: results.map((r) => r.backup).filter(Boolean), results, durationMs: Date.now() - t0,
-  });
+  };
+  if (stopped) {
+    report.aborted = 'new-instance';
+    report.otherPids = stopped.map((o) => o.pid);
+    report.otherRoles = stopped;
+    writeAutoReport(report);
+    autoLog(`自动清理：中途停手 —— 本轮处理 ${results.length}／${targets.length}，改写 ${cleaned}，失败 ${failures}`);
+    say(`自动清理：发现新的 DSH 实例，停手（已处理 ${results.length}／${targets.length}）。`);
+    emit();
+    releaseLock();
+    if (failures) process.exitCode = 1;
+    return;
+  }
+  writeAutoReport(report);
   autoLog(`自动清理：完成，处理 ${targets.length}，改写 ${cleaned}，失败 ${failures}`);
   say(`自动清理：处理 ${targets.length} 个；改写 ${cleaned} 个；失败 ${failures} 个。备份在 ${BACKUP_ROOT}`);
   emit();
+  releaseLock();
   if (failures) process.exitCode = 1;
 }
 
@@ -1271,7 +1331,7 @@ function usage() {
 // 真正的写操作仍只走本文件的 CLI（必须完全退出 DSH）。
 export { DSH_HOME, SESS_ROOT, CACHE_ROOT, STATE_DIR, BACKUP_ROOT, VERSION, CATALOG_TYPE, DISMISS_TYPE };
 export { frameLength, frameTexts, inspect, readCache, listSessions, allSessionIds, emptyCatalogState, rebuildDismiss };
-export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_ARMED, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, readArmed, writeArmed, missedRun, pidAlive, cmdAutoWait, atomicWrite };
+export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_ARMED, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, readArmed, writeArmed, missedRun, pidAlive, cmdAutoWait, atomicWrite, readAutoLogTail, releaseLock };
 export { dshProcessIds, otherDshPids, dshProcesses, classifyProcessCmd, otherInstances, fmtInstances, describeOthers, supersededByNewerArm };
 export { AUTO_HEARTBEAT, readHeartbeat, writeHeartbeat };
 

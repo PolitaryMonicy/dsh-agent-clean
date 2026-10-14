@@ -377,6 +377,45 @@ check('atomicWrite 不留临时文件',
 check('dismiss 之后会话目录里也没有临时文件',
   fs.readdirSync(dirA).every((n) => !n.includes('dsac-write')), fs.readdirSync(dirA).join(' '));
 
+// ---- 6h. 交还锁 + 日志尾巴（面板要能看到助手停在哪一步） --------------------
+console.log('\n6h) releaseLock / readAutoLogTail');
+const lockProbe = path.join(STATE, 'auto.lock');
+const lockOut = spawnSync(process.execPath, ['--input-type=module', '-e', `
+  const m = await import(process.env.DSAC_TEST_CLEAN);
+  const fs = await import('node:fs');
+  const lock = process.env.DSAC_LOCK_PATH;
+  const out = {};
+  // 没有锁时调用：不该抛
+  fs.rmSync(lock, { force: true });
+  m.releaseLock();
+  out.noLockOk = !fs.existsSync(lock);
+  // 自己写的锁：退出前必须交还（否则下一个助手要白等 3 分钟才敢接管死锁）
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, at: Date.now() }), 'utf8');
+  m.releaseLock();
+  out.ownRemoved = !fs.existsSync(lock);
+  // 别人的锁：绝不动
+  fs.writeFileSync(lock, JSON.stringify({ pid: 999999, at: Date.now() }), 'utf8');
+  m.releaseLock();
+  out.foreignKept = fs.existsSync(lock);
+  fs.rmSync(lock, { force: true });
+  // 日志尾巴
+  const stamp = new Date().toISOString();
+  fs.appendFileSync(m.AUTO_LOG, Array.from({ length: 12 }, (_, i) => '[' + stamp + '] line' + (i + 1)).join('\\n') + '\\n', 'utf8');
+  out.tail3 = m.readAutoLogTail(3);
+  out.tailDefault = m.readAutoLogTail().length;
+  process.stdout.write(JSON.stringify(out));
+`], { encoding: 'utf8', env: { ...process.env, DSH_HOME: HOME, DSAC_STATE_DIR: STATE, DSAC_TEST_CLEAN: pathToFileURL(CLEAN).href, DSAC_LOCK_PATH: lockProbe } });
+let lockJson = {};
+try { lockJson = JSON.parse(String(lockOut.stdout || '').trim()); } catch { lockJson = {}; }
+check('退出前把锁交还（不再留死锁让下一个助手空等 3 分钟）',
+  lockJson.ownRemoved === true && lockJson.noLockOk === true,
+  `${lockOut.stdout} ${lockOut.stderr}`.slice(0, 300));
+check('别人的锁不动', lockJson.foreignKept === true, JSON.stringify(lockJson));
+check('日志尾巴只取最后 3 行、默认 8 行',
+  Array.isArray(lockJson.tail3) && lockJson.tail3.length === 3 && String(lockJson.tail3[2]).endsWith('line12')
+  && lockJson.tailDefault === 8,
+  JSON.stringify(lockJson.tail3));
+
 // ---- 7. 可选：真实日志的 dismiss 回归 --------------------------------------
 if (FIXTURE) {
   console.log('\n7) 真实日志 fixture 回归');

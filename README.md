@@ -114,7 +114,15 @@ structural self-check, verification with the real loader — over every session 
 writes `auto-report.json` (`auto.log` keeps a short history). You see the outcome in the page the next time you
 start DSH. Turning the switch off needs no restart: a helper that is still waiting re-reads the switch, sees
 `enabled: false`, and exits without touching anything. If a second DSH instance is still running at that moment,
-the helper skips this window and tries the next one.
+the helper does **not** skip: it keeps waiting until no DSH instance is left at all (only the 72 h cap ends it
+with a "skipped" note).
+
+**To make it actually run**: **fully quit** DSH (closing the window is not enough — it may ask whether to keep
+running in the background), wait a minute or two for the helper to finish (the page's "last auto-clean" line
+refreshes with this run's result), and only then reopen. Cleaning one session takes tens of seconds, while
+"close and immediately reopen" leaves a one-to-two-second gap between boots: the helper confirms over several
+rounds before acting, and stops on the spot as soon as a new instance is up, leaving the rest for next time.
+You can also fully quit DSH and run the commands from section 3 by hand.
 
 This is why the switch lives in the package's own state file rather than in DSH's settings service: a detached
 helper cannot read another process's in-memory settings, and this plugin must stay importable with no dependencies
@@ -199,6 +207,15 @@ Two more constraints (handled by the tool):
   instance starts first and the old one exits afterwards, so the two overlap for a second or two; a 10-second grace
   followed by a skip therefore skipped **every single restart** and lost the whole exit window. Such a restart chain has
   no "zero instances" moment at all, so the real cleanup happens when you **fully close** DSH.)
+- **Every step after the run starts leaves a trace**: `say()` output is discarded for a detached helper (stdio=`ignore`), so
+  before 1.3.7 there was not a single log line between "starting" and "done" — a helper killed in between left no clue how
+  far it got. From 1.3.7 the run is written step by step to `auto.log` (start + how many sessions are pending, each session's
+  id and size, each session's result, the final tally), and the settings page shows the last 8 lines right there
+  ("助手日志最后几行" / helper log, last few lines). The same version fixes two more things: (1) the instance check is
+  repeated before every session, and if a new instance has come up the helper **stops on the spot** (work already done is
+  kept, the report is marked `aborted: "new-instance"`, the rest is left for the next window) — better to do nothing than to
+  keep rewriting sessions someone else may already have open; (2) every exit path (hand-over, switch off, skip, done)
+  **releases the lock**, so a dead lock no longer makes the next helper wait 3 minutes for nothing.
 - **A silent no-show must be visible**: every time the host half arms the helper it records what is waiting for what in
   `auto-armed.json`, and while waiting the helper writes "last seen alive" to `auto-heartbeat.json` every 60 seconds. On
   the next start, if that helper is gone and no report is newer than the arming record, the settings page says so — and
@@ -219,7 +236,7 @@ Two more constraints (handled by the tool):
 
 ## 6. How correctness is proven
 
-- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **57/57 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners and must not call the current instance's own main process "another instance", a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, the rule that a heartbeat is only trusted when it belongs to that very helper, the restart-chain hand-over rule: an older helper yields **only** while the newer helper is alive, and stays as a fallback once it is gone, and write atomicity: bytes land verbatim, no temp file survives, and a dismiss leaves no leftovers in the session directory); **60/60 pass** with a real-log fixture (section below).
+- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **60/60 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners and must not call the current instance's own main process "another instance", a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, the rule that a heartbeat is only trusted when it belongs to that very helper, the restart-chain hand-over rule: an older helper yields **only** while the newer helper is alive, and stays as a fallback once it is gone, write atomicity: bytes land verbatim, no temp file survives, and a dismiss leaves no leftovers in the session directory, and lock release: your own lock is deleted while someone else's is never touched); **63/63 pass** with a real-log fixture (section below).
 - **Offline probes** for the two plugin halves (no DSH, no writes to session storage):
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS` — fakes `window.__ModuleLoader__` and a minimal React
     to prove the settings slot is registered exactly once, that a late `slots` service is still picked up through
@@ -230,7 +247,11 @@ Two more constraints (handled by the tool):
     process is spawned and no cleanup runs.
 - **Auto-clean helper** exercised for real: `clean.mjs autowait` prints `开关关闭，未做任何改动。` when the switch is
   off (exit 0) and writes `{"ran":false,"why":"timeout",…}` to `auto-report.json` when the waited pid never dies —
-  both without touching a session log.
+  both without touching a session log. **1.3.7 end-to-end run** (fake `DSH_HOME` + fake state dir, real log as material,
+  `--no-app` to skip the real loader): the helper rewrote all **22** catalog rows of an 11,443-line / 12,622,844 B session
+  (`catalog 0 / dismissed 22`, line count unchanged), left `开始动手，待处理 1 个会话 → 处理第 1／1 个会话 …（12327 KB）→
+  改写 22 条 → 完成，处理 1，改写 1，失败 0` in `auto.log`, reported `processed:1, cleaned:1`, exited 0, and left no
+  `auto.lock` behind.
 - **Byte-identical on a real log**: with a real session log (11,443 lines / 12,622,844 B),
   `node test/selftest.mjs --fixture <log> --expect-sha256 B51E6D96F3B4CF922282ECA1BBD11BE175EB9D64EAC676F37F746DAB619C3EBA`
   → the produced sha256 is **identical** to the manually validated fix.

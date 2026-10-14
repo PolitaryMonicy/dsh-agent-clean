@@ -40,6 +40,7 @@ import {
   readArm,
   readArmed,
   readAutoReport,
+  readAutoLogTail,
   readCache,
   readHeartbeat,
   writeArm,
@@ -212,6 +213,8 @@ function autoState() {
     // 本轮是谁在等谁 + 它最后一次心跳：设置页据此说明「助手还活着」还是「已经没了」。
     armed: readArmed(),
     heartbeat: readHeartbeat(),
+    // 助手自己的最后几行日志：出问题时面板上就能看出它停在哪一步，不必去翻文件。
+    logTail: readAutoLogTail(8),
   }
 }
 

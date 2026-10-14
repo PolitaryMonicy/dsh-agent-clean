@@ -130,6 +130,10 @@ async function main() {
   check('auto 带本轮助手记录与心跳',
     ('armed' in (v.auto ?? {})) && ('heartbeat' in (v.auto ?? {})),
     JSON.stringify({ armed: v.auto?.armed ?? null, heartbeat: v.auto?.heartbeat ?? null }))
+  // 1.3.7：面板还要能把助手自己的最后几行日志摆出来 —— 否则「上一轮没留下报告」只能靠人翻文件。
+  check('auto 带助手日志尾巴（数组，最多 8 行）',
+    Array.isArray(v.auto?.logTail) && v.auto.logTail.length <= 8,
+    JSON.stringify(v.auto?.logTail ?? null).slice(0, 200))
 
   // settings: GET
   const g = await call(settings.handler, { method: 'GET', headers: LOOPBACK })
