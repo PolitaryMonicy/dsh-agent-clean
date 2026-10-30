@@ -122,6 +122,9 @@ async function main() {
   check('scan 带 auto 段（开关默认启用）', v.auto?.settings?.enabled === true, JSON.stringify(v.auto?.settings ?? null))
   check('scan 带 cliPath / backupRoot', typeof v.cliPath === 'string' && typeof v.backupRoot === 'string', v.cliPath)
   check('scan 能列出会话', Number.isInteger(v.total) && Array.isArray(v.sessions), `total=${v.total}`)
+  // 1.3.8：孤儿投影缓存不再进扫描结果 —— 逐条读它们的缓存文件只为了让面板列一张没人看的清单，
+  // 而条目多时（一台机器 38 个）会把打开设置拖慢。CLI 的 `orphans` 仍然管这件事。
+  check('scan 不再加载孤儿投影缓存（payload 里没有 orphanCaches）', !('orphanCaches' in v), Object.keys(v).join(','))
   check('auto.lastAuto 允许为 null', v.auto?.lastAuto === null || typeof v.auto?.lastAuto === 'object')
   check('auto 带「上一轮有没有跑完」的判定位', 'lastMissed' in (v.auto ?? {}), JSON.stringify(v.auto?.lastMissed ?? null))
   check('auto 带助手记录文件路径', typeof v.auto?.armedFile === 'string' && v.auto.armedFile.endsWith('auto-armed.json'), v.auto?.armedFile)

@@ -318,7 +318,10 @@ function registerWithLoader() {
       useEffect(() => { load() }, [load])
       const value = state.value
       const cli = (value && value.cliPath) || 'clean.cmd'
-      const orphanCount = (value && value.orphanCaches && value.orphanCaches.length) || 0
+      // 唯一的「工作区哈希目录」示例：从任意一个会话目录往上取一层（没有会话时留空）。
+      const wsDir = value && value.sessions.length && value.sessions[0].dir
+        ? String(value.sessions[0].dir).replace(/[\\/][^\\/]+$/, '')
+        : ''
       const box = embedded ? { ...S.panel, ...S.panelEmbedded } : S.panel
       const auto = (value && value.auto) || null
       const autoOn = auto ? auto.settings?.enabled !== false : true
@@ -365,7 +368,7 @@ function registerWithLoader() {
               `v${value.version} · DSH_HOME=${value.dshHome} · 扫描于 ${value.scannedAt}`,
             ),
             h('div', { style: { marginTop: '8px' } },
-              `会话 ${value.total} 个　·　含子代理条目的 ${value.withEntries} 个　·　孤儿投影缓存 ${orphanCount} 个`,
+              `会话 ${value.total} 个　·　含子代理条目的 ${value.withEntries} 个`,
               value.truncated ? '　（已截断显示 300 个）' : '',
             ),
 
@@ -408,9 +411,8 @@ function registerWithLoader() {
               auto && auto.lastMissed
                 ? (() => {
                   const m = auto.lastMissed
-                  const orphanCount = (value && value.orphanCaches && value.orphanCaches.length) || 0
                   // 有活可干才值得报警；没活可干时这一轮跳过没有实际影响，用中性灰字说清楚即可。
-                  const hadWork = (value.withEntries ?? 0) > 0 || orphanCount > 0
+                  const hadWork = (value.withEntries ?? 0) > 0
                   const seen = m.lastSeenAt ? `最后一次心跳 ${m.lastSeenAt}，` : ''
                   const head = `上一轮退出窗口里的助手没留下任何报告：为 pid ${m.waitedPid} 架设的助手`
                     + `${m.helperPid ? `（pid ${m.helperPid}）` : ''}架设于 ${m.at || '未知时间'}，${seen}现已不在`
@@ -464,28 +466,30 @@ function registerWithLoader() {
                   + '并用真实加载器在镜像里自检（会话多时会慢一些）。默认试演 —— 去掉 --apply 只看计划。'
                   + '必须在完全退出 DSH 后执行，执行完再启动 DSH。',
               }),
-              h(CommandLine, { label: '一键清掉所有孤儿投影缓存（低风险）', command: `"${cli}" orphans --apply` }),
               h(CommandLine, { label: '先看总览（不改任何东西）', command: `"${cli}" list` }),
+            ),
+
+            h('div', { style: { ...S.note, marginTop: '12px' } },
+              h('div', { style: { fontWeight: 600 } }, '会话目录长什么样、子代理在哪'),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
+                `会话都在 ${value.sessionsRoot} 下，按工作区各占一个哈希目录`
+                + `${wsDir ? `（例如 ${wsDir}）` : ''}；每个会话是其中一个子目录，里面是 session.v<N>.jsonl(.zstd) 日志。`),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
+                '目录名以 session- 开头的是**真实会话**；不以 session 开头的（一串裸 uuid，例如 '
+                + 'dddd5555-5555-5555-5555-555555555555）是它派生出来的**子代理会话**。'),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
+                '所以「这台机器上还留着哪些子代理痕迹」，看那些裸 uuid 目录就够了：DSH 关闭时删掉它们，'
+                + '等于把子代理的会话本身一起清掉；只想让父会话界面里不再列出子代理、而保留子代理会话，就用上面的 dismiss。'
+                + '「子代理条目」是写在**父会话日志**里的一种事件（subagent/catalog），所以它只出现在下面列出的会话里。'),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
+                '投影缓存（storages/session_projcache/sessions/*.json）里的孤儿记录不在本页加载 —— '
+                + '条目多时它会让面板明显变慢，而它只影响缓存体积、不影响你看到的界面；需要时用 clean.cmd orphans --apply 单独处理。'),
             ),
 
             h('div', { style: { marginTop: '12px', fontWeight: 600 } }, '按会话'),
             value.sessions.length === 0
               ? h('div', { style: S.muted }, '没有找到会话目录。')
               : h('div', null, value.sessions.map((s) => h(SessionCard, { key: s.sessionId, session: s, cli }))),
-
-            orphanCount > 0
-              ? h('div', { style: { marginTop: '12px' } },
-                h('div', { style: { fontWeight: 600 } }, `孤儿投影缓存（${orphanCount}）`),
-                h('div', { style: { ...S.muted, fontSize: '11.5px' } }, '会话目录已经删了、缓存文件还在 —— 这些是 dsh-chat-manager 明确不处理的部分。'),
-                value.orphanCaches.map((o) => h('div', { key: o.sessionId, style: S.card },
-                  h('div', { style: S.row },
-                    h('span', { style: { fontWeight: 600 } }, shortId(o.sessionId)),
-                    h('span', { style: S.muted }, `${fmtBytes(o.size)} · 条目 ${o.catalogCount ?? '—'} · ${o.mtime}`),
-                  ),
-                  h('div', { style: { ...S.muted, fontSize: '11.5px' } }, o.title || '（无标题）'),
-                )),
-              )
-              : null,
           )
           : null,
 

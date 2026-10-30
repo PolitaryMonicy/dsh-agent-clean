@@ -9,6 +9,8 @@ auto-report.json
 auto.lock
 auto-armed.json
 auto-heartbeat.json
+# 扫描缓存（每个日志解析到第几个字节 + 前缀 sha256）：纯加速用的本机状态，不入库
+scan-cache.json
 
 # 依赖与系统垃圾
 node_modules/

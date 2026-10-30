@@ -48,6 +48,7 @@ import { readFileSync, writeFileSync, appendFileSync, copyFileSync, renameSync, 
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import zlib from 'node:zlib';
 
@@ -108,9 +109,9 @@ function frameLength(buf, pos) {
   if (checksum) p += 4;
   return p - pos;
 }
-function frameTexts(buf) {
+function frameTexts(buf, start = 0) {
   const frames = [];
-  let pos = 0;
+  let pos = start;
   while (pos < buf.length) {
     const len = frameLength(buf, pos);
     const text = zlib.zstdDecompressSync(buf.subarray(pos, pos + len)).toString('utf8');
@@ -129,9 +130,12 @@ function isOwnCatalog(row, inherited) {
   try { seq = JSON.parse(row).seq; } catch { return true; } // 解析失败则保守当作需要处理
   return !(typeof seq === 'number' && seq < inherited);
 }
-/** 统计：帧数、行数、自己的 catalog 行数。 */
-function inspect(buf, inherited) {
-  const frames = frameTexts(buf);
+/**
+ * 统计：帧数、行数、自己的 catalog 行数。
+ * `start` 是从哪一帧开始解压（配合扫描缓存，只解压新追加的尾部）。
+ */
+function inspect(buf, inherited, start = 0) {
+  const frames = frameTexts(buf, start);
   let rows = 0, catalog = 0;
   for (const f of frames) {
     rows += f.lines.length;
@@ -192,9 +196,95 @@ function readCache(cachePath) {
     return { exists: true, broken: String(e) };
   }
 }
+// ---------------------------------------------------------------- 扫描缓存
+/**
+ * 逐会话「解压数行」结果的缓存（`<状态目录>/scan-cache.json`）。
+ *
+ * 为什么需要：一个会话日志动辄十几 MB、上万帧，`zstdDecompressSync` 是**逐帧**调用的
+ * （多帧拼接的 buffer 用一次 zstdDecompressSync 只会解出第一帧），所以全量解析要好几秒；
+ * 设置页每打开一次都全量解析，面板就会明显卡住。
+ *
+ * 日志只有两种变化：DSH 往尾部**追加**帧，或本工具 `dismiss`/`purge` **整份重写**。于是：
+ *   1. 文件大小与 mtime 都没变（且继承条数没变）→ 直接复用旧结果，连读都不用读；
+ *   2. 变大了且「已解析前缀」的 sha256 仍然一致 → 只解压新增的尾部，把计数累加上去；
+ *   3. 其余情况（被重写、变小、继承条数变了、解析出错）→ 整份重解，结果照常正确。
+ * 缓存只是加速，任何情况下算出来的数字都与全量解析一致；状态目录不可写时自动退化成全量解析。
+ */
+const SCAN_CACHE_FILE = join(STATE_DIR, 'scan-cache.json');
+
+function readScanCache() {
+  try {
+    const j = JSON.parse(readFileSync(SCAN_CACHE_FILE, 'utf8'));
+    return j && j.files && typeof j.files === 'object' ? j.files : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeScanCache(files) {
+  try {
+    atomicWrite(SCAN_CACHE_FILE, JSON.stringify({ version: 1, files }) + '\n', 'utf8');
+  } catch {
+    /* 状态目录不可写：不缓存，每次都全量解析 */
+  }
+}
+
+function prefixHash(buf, until) {
+  return createHash('sha256').update(buf.subarray(0, until)).digest('hex');
+}
+
+/**
+ * 带缓存地统计一个日志文件（帧数／行数／自己的 catalog 行数）。
+ * @param {string} logPath - 会话日志绝对路径。
+ * @param {{size:number, mtimeMs?:number, mtime?:Date}} st - `statSync` 的结果。
+ * @param {number} inherited - fork 继承区条数（会随投影缓存变化，必须计入缓存键）。
+ * @param {object} prev - 上次的缓存表（只读）。
+ * @param {object} next - 本次要写回的缓存表（会被填充）。
+ * @returns {{frames:number, rows:number, catalog:number, cached:boolean}}
+ */
+function inspectCached(logPath, st, inherited, prev, next) {
+  const mtimeMs = typeof st.mtimeMs === 'number' ? st.mtimeMs : 0;
+  const hit = prev[logPath];
+  if (hit && hit.size === st.size && hit.mtimeMs === mtimeMs && hit.inherited === inherited) {
+    next[logPath] = hit;
+    return { frames: hit.frames, rows: hit.rows, catalog: hit.catalog, cached: true };
+  }
+  const buf = readFileSync(logPath);
+  let start = 0;
+  let base = { frames: 0, rows: 0, catalog: 0 };
+  if (hit && hit.inherited === inherited && Number.isInteger(hit.parsedUntil)
+      && hit.parsedUntil > 0 && hit.parsedUntil < buf.length) {
+    let same = false;
+    try {
+      same = typeof hit.prefixHash === 'string' && prefixHash(buf, hit.parsedUntil) === hit.prefixHash;
+    } catch {
+      same = false;
+    }
+    if (same) {
+      start = hit.parsedUntil;
+      base = { frames: hit.frames, rows: hit.rows, catalog: hit.catalog };
+    }
+  }
+  const tail = inspect(buf, inherited, start);
+  const out = {
+    frames: base.frames + tail.frames,
+    rows: base.rows + tail.rows,
+    catalog: base.catalog + tail.catalog,
+  };
+  next[logPath] = {
+    size: st.size, mtimeMs, inherited, parsedUntil: buf.length,
+    frames: out.frames, rows: out.rows, catalog: out.catalog,
+    prefixHash: prefixHash(buf, buf.length),
+  };
+  return { ...out, cached: false };
+}
+
 function listSessions(workspaceFilter) {
   const out = [];
   if (!existsSync(SESS_ROOT)) return out;
+  const prev = readScanCache();
+  const next = {};
+  let dirty = false;
   for (const project of readdirSync(SESS_ROOT, { withFileTypes: true })) {
     if (!project.isDirectory()) continue;
     if (workspaceFilter && !project.name.includes(workspaceFilter)) continue;
@@ -210,8 +300,13 @@ function listSessions(workspaceFilter) {
       const cachePath = join(CACHE_ROOT, entry.name + '.json');
       const cache = readCache(cachePath);
       let info = { frames: null, rows: null, catalog: null, broken: '' };
-      try { info = { ...inspect(readFileSync(logPath), cache.inherited ?? 0), broken: '' }; }
-      catch (e) { info = { frames: null, rows: null, catalog: null, broken: String((e && e.message) || e) }; }
+      try {
+        const seen = inspectCached(logPath, st, cache.inherited ?? 0, prev, next);
+        info = { frames: seen.frames, rows: seen.rows, catalog: seen.catalog, broken: '' };
+        if (!seen.cached) dirty = true;
+      } catch (e) {
+        info = { frames: null, rows: null, catalog: null, broken: String((e && e.message) || e) };
+      }
       out.push({
         project: project.name, projectLabel: decodeEscapes(project.name), sessionId: entry.name, dir, logPath,
         logName: logs[0].name, generation: logs[0].gen.version, size: st.size, mtime: st.mtime,
@@ -220,6 +315,7 @@ function listSessions(workspaceFilter) {
       });
     }
   }
+  if (dirty || Object.keys(prev).length !== Object.keys(next).length) writeScanCache(next);
   return out;
 }
 

@@ -416,6 +416,52 @@ check('日志尾巴只取最后 3 行、默认 8 行',
   && lockJson.tailDefault === 8,
   JSON.stringify(lockJson.tail3));
 
+// ---- 6i. 扫描缓存：追加只解压尾部，被重写必须整份重解 ----------------------
+// 一个十几 MB、上万帧的会话日志，逐帧 zstdDecompressSync 要好几秒；设置页每次打开都全量解析会明显卡。
+// 缓存必须「只在能证明前缀没变时才增量」，否则会数错条目 —— 这里把三条路径都钉住。
+{
+  console.log('\n6i) 扫描缓存（增量解析）');
+  const PERF = '-C-Users-Test-perfscan--';
+  const PID = 'session-1111aaaa-1111-1111-1111-111111111111';
+  const dirP = path.join(SESS, PERF, PID);
+  fs.mkdirSync(dirP, { recursive: true });
+  const logP = path.join(dirP, 'session.v4.jsonl.zstd');
+  const catP = (seq, id) => JSON.stringify({ seq, type: 'subagent/catalog', ignorable: false, data: { childId: id, label: id } });
+  const msgP = (seq, text) => JSON.stringify({ seq, type: 'message/user', data: { text } });
+  fs.writeFileSync(logP, Buffer.concat([
+    frame([headerRow(PID), metaRow, msgRow, catP(2, 'p1')]),
+    frame([catP(4, 'p2')]),
+  ]));
+  const countOfP = () => {
+    const out = run(['list', '--workspace', 'perfscan']).out;
+    const m = /日志中 (\d+) 条/.exec(out);
+    return m ? Number(m[1]) : -1;
+  };
+  check('扫描缓存：首次解析数对（2 条）', countOfP() === 2, String(countOfP()));
+  const cacheFile = path.join(STATE, 'scan-cache.json');
+  let scanCache = {};
+  try { scanCache = JSON.parse(fs.readFileSync(cacheFile, 'utf8')).files || {}; } catch { scanCache = {}; }
+  const entry = scanCache[logP] || null;
+  check('扫描缓存：落盘并记下前缀指纹（可增量）',
+    Boolean(entry) && typeof entry.prefixHash === 'string' && entry.parsedUntil === fs.statSync(logP).size
+    && entry.frames === 2 && entry.catalog === 2,
+    JSON.stringify(entry));
+  // ① DSH 就是这样让日志长出来的：尾部追加一帧 → 计数必须 +1
+  fs.appendFileSync(logP, frame([catP(6, 'p3')]));
+  check('扫描缓存：追加一帧后计数 +1', countOfP() === 3, String(countOfP()));
+  // ② 整份重写（dismiss/外部工具会这样）且文件**变大了**：前缀已变，必须整份重解。
+  //    若错误地继续「只解压尾部」，这里会数成 3 而不是 1。
+  const pad = Array.from({ length: 40 }, (_, i) => msgP(i, 'padding line ' + i));
+  fs.writeFileSync(logP, Buffer.concat([
+    frame([headerRow(PID), metaRow, msgRow, catP(2, 'q1')]),
+    frame(pad),
+  ]));
+  check('扫描缓存：被重写（即使变大）也必须整份重解（1 条）', countOfP() === 1, String(countOfP()));
+  // ③ 变小（整份删掉 catalog 行）：会话不再出现在清单里
+  fs.writeFileSync(logP, Buffer.concat([frame([headerRow(PID), metaRow, msgRow]), frame(pad)]));
+  check('扫描缓存：变小后也不残留旧计数（不再列出）', countOfP() === -1, String(countOfP()));
+}
+
 // ---- 7. 可选：真实日志的 dismiss 回归 --------------------------------------
 if (FIXTURE) {
   console.log('\n7) 真实日志 fixture 回归');

@@ -86,11 +86,23 @@ dsh plugin --profile desktop add /path/to/this/repo                       # loca
 Then **quit DSH completely and start it again**. A page appears at **Settings → 会话清理诊断 /
 Session cleanup** (the floating 🧹 button older builds had is gone).
 
-The page scans `$DSH_HOME` (the same code as `list` + `orphans`), shows per-session subagent-entry counts, log
-sizes, cache titles and orphaned caches, and gives you copy-ready `dismiss` / `purge` / `orphans` commands —
-including **one that clears the subagent entries of every session at once**. If the page reports
-`宿主返回 HTTP 404`, the host half did not load — check `dsh --profile desktop --dump-config` for the entry and
-`%TEMP%\dsh-agent-clean-host.log` for the reason.
+The page scans `$DSH_HOME` (the same code as `list`), shows per-session subagent-entry counts, log sizes and
+cache titles, and gives you copy-ready `dismiss` / `purge` commands — including **one that clears the subagent
+entries of every session at once**. It also explains the layout: sessions live under
+`$DSH_HOME/sessions/<workspace-hash>/`, where a directory named `session-…` is a real session and a
+bare-uuid directory is a subagent session derived from it — deleting those bare-uuid directories (with DSH
+closed) removes the subagent's own trace entirely.
+
+**It no longer loads "orphaned projection caches"**: reading each of those leftovers (session directory gone,
+cache file still under `storages/session_projcache/sessions/`) only fed a list of little value, and with dozens
+of them it visibly slowed the page down; they cost cache space only, not what you see in the UI. Run
+`clean.cmd orphans --apply` when you do want them gone (the CLI still supports it). The scan is also
+**incremental** (`<state dir>/scan-cache.json`): after the first parse only the appended tail of a log is
+decompressed, so opening the page a second time is nearly instant — even for a session of tens of MB and tens
+of thousands of frames (measured here: 4.7 s → 25 ms).
+
+If the page reports `宿主返回 HTTP 404`, the host half did not load — check
+`dsh --profile desktop --dump-config` for the entry and `%TEMP%\dsh-agent-clean-host.log` for the reason.
 
 The page also carries a switch (see 2.2). Neither the page nor the switch ever touches session storage while DSH
 is running: DSH's persistence contract forbids rewriting committed events (`seq` must stay dense, single writer)
@@ -227,6 +239,19 @@ Two more constraints (handled by the tool):
   (`helper-crash`) and session-listing failure (`list-failed`) — and the helper shell installs
   `uncaughtException` / `unhandledRejection` handlers, so the next start can always tell "it crashed (with the error
   text)" from "it was killed along with something else (heartbeat stopped at …)".
+- **The scan is incremental** (1.3.8): a session log easily reaches tens of MB and tens of thousands of frames, and zstd
+  can only be decompressed **frame by frame** (handing a buffer of concatenated frames to a single
+  `zstdDecompressSync` yields only the first one), so a full parse takes seconds — and the settings page used to do a
+  full parse on every open, which made the panel visibly stall. Each log's frame/row/own-entry counts are now stored with
+  the byte offset already parsed and the sha256 of that prefix in `<state dir>/scan-cache.json`: unchanged size+mtime is
+  reused as is; a larger file whose prefix hash still matches only decompresses the appended tail; anything else (rewritten,
+  shrunk, fence changed, parse error) is parsed in full. The cache only accelerates — the numbers always equal a full
+  parse — and an unwritable state dir simply degrades to full parsing. (Measured here: 49.8 MB across 5 sessions,
+  4.7 s → 25 ms.)
+- **The panel no longer loads orphaned projection caches** (1.3.8): reading each leftover just to list it was the wrong
+  trade — with dozens of them it slowed the page down, while they only cost cache space and never change what the UI shows.
+  Clean them with `orphans --apply` when you want to; the page instead explains the layout above the session list
+  (`$DSH_HOME/sessions/<workspace-hash>/`, `session-…` = a real session, bare uuid = a subagent session).
 - **Forked sessions**: the first part of such a log is the parent's **inherited region**
   (`identity.inheritedEventCount`) and may contain the parent's own `subagent/catalog` rows. Those rows do not belong
   to this session: they are kept **byte-for-byte**, and the self-check must **not** count them as "remaining
@@ -236,7 +261,7 @@ Two more constraints (handled by the tool):
 
 ## 6. How correctness is proven
 
-- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **60/60 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners and must not call the current instance's own main process "another instance", a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, the rule that a heartbeat is only trusted when it belongs to that very helper, the restart-chain hand-over rule: an older helper yields **only** while the newer helper is alive, and stays as a fallback once it is gone, write atomicity: bytes land verbatim, no temp file survives, and a dismiss leaves no leftovers in the session directory, and lock release: your own lock is deleted while someone else's is never touched); **63/63 pass** with a real-log fixture (section below).
+- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **65/65 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners and must not call the current instance's own main process "another instance", a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, the rule that a heartbeat is only trusted when it belongs to that very helper, the restart-chain hand-over rule: an older helper yields **only** while the newer helper is alive, and stays as a fallback once it is gone, write atomicity: bytes land verbatim, no temp file survives, and a dismiss leaves no leftovers in the session directory, lock release: your own lock is deleted while someone else's is never touched, and the three scan-cache paths: an appended frame only decompresses the tail, a rewritten file — even a larger one — must be re-parsed in full, and a shrunk file leaves no stale count behind); **68/68 pass** with a real-log fixture (section below).
 - **Offline probes** for the two plugin halves (no DSH, no writes to session storage):
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS` — fakes `window.__ModuleLoader__` and a minimal React
     to prove the settings slot is registered exactly once, that a late `slots` service is still picked up through

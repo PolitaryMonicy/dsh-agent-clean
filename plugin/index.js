@@ -21,7 +21,7 @@
  * clean.mjs 里有「直接被调用才跑 CLI」的守卫，import 它不会执行任何命令。
  */
 import { spawn } from 'node:child_process'
-import { appendFileSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { appendFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -33,7 +33,6 @@ import {
   DSH_HOME,
   SESS_ROOT,
   VERSION,
-  allSessionIds,
   listSessions,
   missedRun,
   pidAlive,
@@ -41,7 +40,6 @@ import {
   readArmed,
   readAutoReport,
   readAutoLogTail,
-  readCache,
   readHeartbeat,
   writeArm,
   writeArmed,
@@ -274,39 +272,6 @@ function armHelper(reason) {
   }
 }
 
-/** 「目录已被删、投影缓存还在」的残骸：`session_projcache/sessions/*.json` 里没有会话目录的那些。 */
-function orphanCaches() {
-  const known = new Set(allSessionIds())
-  if (!existsSync(CACHE_ROOT)) return []
-  const out = []
-  for (const name of readdirSync(CACHE_ROOT)) {
-    if (!name.endsWith('.json')) continue
-    const sessionId = name.slice(0, -'.json'.length)
-    if (known.has(sessionId)) continue
-    const path = join(CACHE_ROOT, name)
-    let size = 0
-    let mtime = ''
-    try {
-      const st = statSync(path)
-      size = st.size
-      mtime = st.mtime.toISOString()
-    } catch {
-      /* 竞态：刚好被删 */
-    }
-    const cache = readCache(path)
-    out.push({
-      sessionId,
-      path,
-      size,
-      mtime,
-      title: typeof cache?.title === 'string' ? cache.title : '',
-      catalogCount: cache?.catalogCount ?? null,
-      broken: cache?.broken ?? '',
-    })
-  }
-  return out.sort((a, b) => b.size - a.size)
-}
-
 /** 只读扫描（绝不写盘）。 */
 export function scan() {
   const sessions = listSessions(undefined).map((s) => ({
@@ -341,7 +306,6 @@ export function scan() {
     withEntries: sessions.filter((s) => (s.catalog ?? 0) > 0).length,
     truncated: sessions.length > MAX_SESSIONS,
     sessions: sessions.slice(0, MAX_SESSIONS),
-    orphanCaches: orphanCaches(),
     auto: autoState(),
   }
 }
