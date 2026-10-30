@@ -121,7 +121,9 @@ async function main() {
   const v = s.json?.value ?? {}
   check('scan 带 auto 段（开关默认启用）', v.auto?.settings?.enabled === true, JSON.stringify(v.auto?.settings ?? null))
   check('scan 带 cliPath / backupRoot', typeof v.cliPath === 'string' && typeof v.backupRoot === 'string', v.cliPath)
-  check('scan 能列出会话', Number.isInteger(v.total) && Array.isArray(v.sessions), `total=${v.total}`)
+  // 1.3.9：面板不再解压任何会话日志 —— scan 只数目录，payload 里没有 sessions／withEntries 这类逐会话明细。
+  check('scan 只读目录、不解压日志（没有 sessions／withEntries）',
+    Number.isInteger(v.total) && !('sessions' in v) && !('withEntries' in v), `total=${v.total}`)
   // 1.3.8：孤儿投影缓存不再进扫描结果 —— 逐条读它们的缓存文件只为了让面板列一张没人看的清单，
   // 而条目多时（一台机器 38 个）会把打开设置拖慢。CLI 的 `orphans` 仍然管这件事。
   check('scan 不再加载孤儿投影缓存（payload 里没有 orphanCaches）', !('orphanCaches' in v), Object.keys(v).join(','))

@@ -105,13 +105,6 @@ function registerWithLoader() {
       td: { padding: '4px 6px', borderBottom: '1px solid color-mix(in srgb, CanvasText 10%, Canvas)', verticalAlign: 'top' },
     }
 
-    function fmtBytes(n) {
-      if (typeof n !== 'number' || !isFinite(n)) return '—'
-      if (n < 1024) return n + ' B'
-      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
-      return (n / 1024 / 1024).toFixed(2) + ' MB'
-    }
-
     function shortId(id) {
       return String(id || '').replace(/^session-/, '').slice(0, 8)
     }
@@ -264,53 +257,6 @@ function registerWithLoader() {
       )
     }
 
-    function SessionCard({ session, cli }) {
-      const [open, setOpen] = useState(false)
-      const q = (p) => '"' + p + '"'
-      const dismiss = `${q(cli)} dismiss --session ${session.sessionId} --apply`
-      const purge = `${q(cli)} purge --session ${session.sessionId} --apply`
-      return h('div', { style: S.card },
-        h('div', { style: S.row },
-          h('div', null,
-            h('span', { style: { fontWeight: 600 } }, shortId(session.sessionId)),
-            h('span', { style: { ...S.muted, marginLeft: '6px' } }, session.workspace || session.dir),
-          ),
-          h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } },
-            h('span', {
-              style: {
-                ...S.badge,
-                background: (session.catalog ?? 0) > 0
-                  ? 'color-mix(in srgb, #d9534f 28%, Canvas)'
-                  : 'color-mix(in srgb, CanvasText 12%, Canvas)',
-              },
-            }, `${session.catalog ?? '?'} 条`),
-            h('button', { style: S.btn, onClick: () => setOpen(!open) }, open ? '收起' : '命令'),
-          ),
-        ),
-        h('div', { style: { ...S.muted, marginTop: '3px', fontSize: '11.5px' } },
-          `${session.log} · v${session.generation} · ${session.rows ?? '?'} 行 · ${fmtBytes(session.size)} · ${session.mtime}`,
-        ),
-        h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11.5px' } },
-          `投影标题：${session.cacheTitle || '（无）'} · 缓存检查点条目：${session.cacheCatalogCount ?? '—'} · 继承事件数：${session.inherited}`,
-        ),
-        session.broken ? h('div', { style: { color: '#d9534f', marginTop: '2px', fontSize: '11.5px' } }, `日志读取失败：${session.broken}`) : null,
-        open
-          ? h('div', null,
-            h(CommandLine, {
-              label: '① 去掉这个会话里的子代理条目（非破坏：保留全部行与 seq）',
-              command: dismiss,
-              hint: '默认试演；去掉 --apply 只看计划。',
-            }),
-            h(CommandLine, {
-              label: '② 彻底删除这个会话（目录 + 全部日志 + 投影缓存）',
-              command: purge,
-              hint: '危险操作，会先整份备份。',
-            }),
-          )
-          : null,
-      )
-    }
-
     function Panel({ embedded, onClose }) {
       const [state, load] = useScan()
       const [busy, setBusy] = useState(false)
@@ -319,9 +265,6 @@ function registerWithLoader() {
       const value = state.value
       const cli = (value && value.cliPath) || 'clean.cmd'
       // 唯一的「工作区哈希目录」示例：从任意一个会话目录往上取一层（没有会话时留空）。
-      const wsDir = value && value.sessions.length && value.sessions[0].dir
-        ? String(value.sessions[0].dir).replace(/[\\/][^\\/]+$/, '')
-        : ''
       const box = embedded ? { ...S.panel, ...S.panelEmbedded } : S.panel
       const auto = (value && value.auto) || null
       const autoOn = auto ? auto.settings?.enabled !== false : true
@@ -368,8 +311,8 @@ function registerWithLoader() {
               `v${value.version} · DSH_HOME=${value.dshHome} · 扫描于 ${value.scannedAt}`,
             ),
             h('div', { style: { marginTop: '8px' } },
-              `会话 ${value.total} 个　·　含子代理条目的 ${value.withEntries} 个`,
-              value.truncated ? '　（已截断显示 300 个）' : '',
+              `会话目录 ${value.total} 个　·　本页只读目录名，不解压任何会话日志`
+              + '（要逐会话明细就跑下面的 list，它才解压，而且带增量缓存）',
             ),
 
             h('div', { style: S.card },
@@ -411,16 +354,13 @@ function registerWithLoader() {
               auto && auto.lastMissed
                 ? (() => {
                   const m = auto.lastMissed
-                  // 有活可干才值得报警；没活可干时这一轮跳过没有实际影响，用中性灰字说清楚即可。
-                  const hadWork = (value.withEntries ?? 0) > 0
                   const seen = m.lastSeenAt ? `最后一次心跳 ${m.lastSeenAt}，` : ''
-                  const head = `上一轮退出窗口里的助手没留下任何报告：为 pid ${m.waitedPid} 架设的助手`
+                  return h('div', { style: { marginTop: '2px', fontSize: '11.5px', color: '#b8860b' } },
+                    `⚠ 上一轮退出窗口里的助手没留下任何报告：为 pid ${m.waitedPid} 架设的助手`
                     + `${m.helperPid ? `（pid ${m.helperPid}）` : ''}架设于 ${m.at || '未知时间'}，${seen}现已不在`
-                    + '（纯 JS 异常一定会留下 helper-crash 报告，所以没有报告多半是它被外力结束：关机、任务管理器，或被连带杀掉）'
-                  return h('div', { style: { marginTop: '2px', fontSize: '11.5px', color: hadWork ? '#d9534f' : 'GrayText' } },
-                    hadWork
-                      ? `⚠ ${head}当前还有待清理的条目，下次「完全退出」DSH 时会自动重试。`
-                      : `${head}当前没有待清理的条目，这一轮跳过没有影响；下次「完全退出」DSH 时会自动重试。`)
+                    + '（纯 JS 异常一定会留下 helper-crash 报告，所以没有报告多半是它被外力结束：关机、任务管理器，'
+                    + '或被连带杀掉）。下一次「完全退出」DSH 时助手会自动重试；本页不解压日志，判断不了还有没有'
+                    + '待清理条目 —— 想确认就跑一次下面的 list。')
                 })()
                 : null,
               auto && auto.armed
@@ -448,6 +388,29 @@ function registerWithLoader() {
             ),
 
             h('div', { style: S.note },
+              h('div', { style: { fontWeight: 600 } }, '如何锁定或删改本地会话日志？'),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
+                '这个助手只会把 DSH 界面上的子代理条目去掉（改的是父会话日志里那几行 catalog 事件），'
+                + '不会改动设备上的任何目录或文件。若想直接修改或删除本地会话日志，请到下面两处手动处理，'
+                + '并且先「完全退出 DSH」：'),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
+                `· 会话日志：${value.sessionsRoot} 下，每个工作区对应其中一个文件夹（例如 `
+                + `${value.sessionsRoot}\\<工作区哈希>\\）；每个会话又是它下面的一个子目录 —— `
+                + '目录名以 session 开头的是父会话，不以 session 开头的一串裸 uuid 是子代理（例如 '
+                + `${value.sessionsRoot}\\<工作区哈希>\\dddd5555-5555-5555-5555-555555555555）。`),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
+                `· 投影缓存：${value.cacheRoot} 下，每个父会话与每个子代理各一份 <会话id>.json（记事本就能打开）；`
+                + '它只是缓存，删掉不会动到会话内容，下次运行会自动重建。'),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
+                '只想清掉子代理、保留父会话：删掉第一处里所有不以 session 开头的目录，再删掉第二处里与这些裸 uuid '
+                + '同名的 .json（也就是不以 session 开头的那些）。按「修改时间」排序最容易定位 —— 子代理的目录和'
+                + '缓存通常与它所属的父会话同时或稍晚出现。'),
+              h('div', { style: { ...S.muted, marginTop: '3px' } },
+                '（区别：删目录＝把子代理会话本身彻底删掉；下面命令里的 dismiss 只改父会话日志，让界面不再列出子代理，'
+                + '子代理目录仍留在盘上。孤儿投影缓存可以用 clean.cmd orphans --apply 单独清。）'),
+            ),
+
+            h('div', { style: { ...S.note, marginTop: '12px' } },
               h('div', { style: { fontWeight: 600 } }, '这个面板不会在 DSH 运行中改动会话存储。'),
               h('div', { style: { ...S.muted, marginTop: '3px' } },
                 'DSH 的契约不允许在运行中改写已提交的事件（seq 必须稠密、单写者），投影缓存也没有失效 API。' +
@@ -460,36 +423,14 @@ function registerWithLoader() {
                 `命令走本插件自带的 CLI：${value.cliPath}（备份默认落在 ${value.backupRoot}，可用 DSAC_BACKUP_DIR 改）。`,
               ),
               h(CommandLine, {
-                label: `一键清掉所有会话的子代理条目（当前 ${value.withEntries} 个会话有条目）`,
+                label: '一键清掉所有会话的子代理条目',
                 command: `"${cli}" dismiss --all --apply`,
                 hint: '非破坏：保留全部行与 seq，只把「自己的」catalog 行改成被忽略的类型；每个会话都会先整份备份、'
                   + '并用真实加载器在镜像里自检（会话多时会慢一些）。默认试演 —— 去掉 --apply 只看计划。'
                   + '必须在完全退出 DSH 后执行，执行完再启动 DSH。',
               }),
-              h(CommandLine, { label: '先看总览（不改任何东西）', command: `"${cli}" list` }),
+              h(CommandLine, { label: '先看总览：每个会话有几条、日志多大、缓存标题（会解压日志，带增量缓存）', command: `"${cli}" list` }),
             ),
-
-            h('div', { style: { ...S.note, marginTop: '12px' } },
-              h('div', { style: { fontWeight: 600 } }, '会话目录长什么样、子代理在哪'),
-              h('div', { style: { ...S.muted, marginTop: '3px' } },
-                `会话都在 ${value.sessionsRoot} 下，按工作区各占一个哈希目录`
-                + `${wsDir ? `（例如 ${wsDir}）` : ''}；每个会话是其中一个子目录，里面是 session.v<N>.jsonl(.zstd) 日志。`),
-              h('div', { style: { ...S.muted, marginTop: '3px' } },
-                '目录名以 session- 开头的是「真实会话」；不以 session 开头的（一串裸 uuid，例如 '
-                + 'dddd5555-5555-5555-5555-555555555555）是它派生出来的「子代理会话」。'),
-              h('div', { style: { ...S.muted, marginTop: '3px' } },
-                '所以「这台机器上还留着哪些子代理痕迹」，看那些裸 uuid 目录就够了：DSH 关闭时删掉它们，'
-                + '等于把子代理的会话本身一起清掉；只想让父会话界面里不再列出子代理、而保留子代理会话，就用上面的 dismiss。'
-                + '「子代理条目」是写在「父会话日志」里的一种事件（subagent/catalog），所以它只出现在下面列出的会话里。'),
-              h('div', { style: { ...S.muted, marginTop: '3px' } },
-                '投影缓存（storages/session_projcache/sessions/*.json）里的孤儿记录不在本页加载 —— '
-                + '条目多时它会让面板明显变慢，而它只影响缓存体积、不影响你看到的界面；需要时用 clean.cmd orphans --apply 单独处理。'),
-            ),
-
-            h('div', { style: { marginTop: '12px', fontWeight: 600 } }, '按会话'),
-            value.sessions.length === 0
-              ? h('div', { style: S.muted }, '没有找到会话目录。')
-              : h('div', null, value.sessions.map((s) => h(SessionCard, { key: s.sessionId, session: s, cli }))),
           )
           : null,
 

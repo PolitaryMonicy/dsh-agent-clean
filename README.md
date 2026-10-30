@@ -86,20 +86,25 @@ dsh plugin --profile desktop add /path/to/this/repo                       # loca
 Then **quit DSH completely and start it again**. A page appears at **Settings → 会话清理诊断 /
 Session cleanup** (the floating 🧹 button older builds had is gone).
 
-The page scans `$DSH_HOME` (the same code as `list`), shows per-session subagent-entry counts, log sizes and
-cache titles, and gives you copy-ready `dismiss` / `purge` commands — including **one that clears the subagent
-entries of every session at once**. It also explains the layout: sessions live under
-`$DSH_HOME/sessions/<workspace-hash>/`, where a directory named `session-…` is a real session and a
-bare-uuid directory is a subagent session derived from it — deleting those bare-uuid directories (with DSH
-closed) removes the subagent's own trace entirely.
+The page **reads directory names only — it never decompresses a session log**: it counts the session directories
+under `$DSH_HOME/sessions/`, hands you copy-ready `dismiss` / `purge` commands — including **one that clears the
+subagent entries of every session at once** — and, where the per-session list used to be, explains how to find and
+edit the logs by hand: each workspace owns one hashed directory under `$DSH_HOME/sessions/`, a directory named
+`session…` is a parent session and a bare-uuid directory is a subagent session; projection caches live one
+`<session-id>.json` per session under `$DSH_HOME/storages/session_projcache/sessions/`. To wipe the subagents
+entirely, delete the bare-uuid directories (with DSH closed) plus the `.json` files of the same names — sorting by
+"Date modified" makes them easy to spot.
 
-**It no longer loads "orphaned projection caches"**: reading each of those leftovers (session directory gone,
-cache file still under `storages/session_projcache/sessions/`) only fed a list of little value, and with dozens
-of them it visibly slowed the page down; they cost cache space only, not what you see in the UI. Run
-`clean.cmd orphans --apply` when you do want them gone (the CLI still supports it). The scan is also
+**Per-session detail is the CLI's job**: to see how many entries a session has, how big its log is and what the
+cache holds, run `clean.cmd list` (or the command on the page). That one does decompress logs, and it is
 **incremental** (`<state dir>/scan-cache.json`): after the first parse only the appended tail of a log is
-decompressed, so opening the page a second time is nearly instant — even for a session of tens of MB and tens
-of thousands of frames (measured here: 4.7 s → 25 ms).
+decompressed, so a second run is nearly instant — even for a session of tens of MB and tens of thousands of frames
+(measured here: 4.7 s → 25 ms).
+
+**It no longer loads "orphaned projection caches"**: reading each of those leftovers (session directory gone, cache
+file still under `storages/session_projcache/sessions/`) only fed a list of little value, and with dozens of them it
+visibly slowed the page down; they cost cache space only, not what you see in the UI. Run
+`clean.cmd orphans --apply` when you do want them gone (the CLI still supports it).
 
 If the page reports `宿主返回 HTTP 404`, the host half did not load — check
 `dsh --profile desktop --dump-config` for the entry and `%TEMP%\dsh-agent-clean-host.log` for the reason.
@@ -239,19 +244,21 @@ Two more constraints (handled by the tool):
   (`helper-crash`) and session-listing failure (`list-failed`) — and the helper shell installs
   `uncaughtException` / `unhandledRejection` handlers, so the next start can always tell "it crashed (with the error
   text)" from "it was killed along with something else (heartbeat stopped at …)".
-- **The scan is incremental** (1.3.8): a session log easily reaches tens of MB and tens of thousands of frames, and zstd
-  can only be decompressed **frame by frame** (handing a buffer of concatenated frames to a single
+- **The CLI's scan is incremental** (1.3.8): a session log easily reaches tens of MB and tens of thousands of frames, and
+  zstd can only be decompressed **frame by frame** (handing a buffer of concatenated frames to a single
   `zstdDecompressSync` yields only the first one), so a full parse takes seconds — and the settings page used to do a
   full parse on every open, which made the panel visibly stall. Each log's frame/row/own-entry counts are now stored with
   the byte offset already parsed and the sha256 of that prefix in `<state dir>/scan-cache.json`: unchanged size+mtime is
   reused as is; a larger file whose prefix hash still matches only decompresses the appended tail; anything else (rewritten,
   shrunk, fence changed, parse error) is parsed in full. The cache only accelerates — the numbers always equal a full
   parse — and an unwritable state dir simply degrades to full parsing. (Measured here: 49.8 MB across 5 sessions,
-  4.7 s → 25 ms.)
-- **The panel no longer loads orphaned projection caches** (1.3.8): reading each leftover just to list it was the wrong
-  trade — with dozens of them it slowed the page down, while they only cost cache space and never change what the UI shows.
-  Clean them with `orphans --apply` when you want to; the page instead explains the layout above the session list
-  (`$DSH_HOME/sessions/<workspace-hash>/`, `session-…` = a real session, bare uuid = a subagent session).
+  4.7 s → 25 ms.) Since 1.3.9 the panel no longer calls it at all; only `list`, `dismiss` and the quit-time helper do.
+- **The panel neither loads orphaned projection caches nor decompresses any log** (1.3.8 / 1.3.9): reading each leftover
+  just to list it was the wrong trade — with dozens of them it slowed the page down, while they only cost cache space and
+  never change what the UI shows. Clean them with `orphans --apply` when you want to. The page now only reads directory
+  names, so it is ready as soon as it opens, and where the per-session list used to sit it explains
+  "how to find and edit local session logs?" (`$DSH_HOME/sessions/<workspace-hash>/`, `session…` = a parent session,
+  bare uuid = a subagent; the cache path; and the "delete only the two things that do not start with `session`" recipe).
 - **Forked sessions**: the first part of such a log is the parent's **inherited region**
   (`identity.inheritedEventCount`) and may contain the parent's own `subagent/catalog` rows. Those rows do not belong
   to this session: they are kept **byte-for-byte**, and the self-check must **not** count them as "remaining

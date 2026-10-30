@@ -21,7 +21,7 @@
  * clean.mjs 里有「直接被调用才跑 CLI」的守卫，import 它不会执行任何命令。
  */
 import { spawn } from 'node:child_process'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -33,7 +33,6 @@ import {
   DSH_HOME,
   SESS_ROOT,
   VERSION,
-  listSessions,
   missedRun,
   pidAlive,
   readArm,
@@ -60,9 +59,6 @@ export const SETTINGS_ROUTE = '/plugins/dsh-agent-clean/settings'
 
 /** POST 体上限（这里只可能收到 {"enabled":false} 这种小对象）。 */
 const BODY_LIMIT = 8192
-
-/** 一次回给面板的会话上限（超出时置 truncated，面板会提示收窄工作区）。 */
-const MAX_SESSIONS = 300
 
 /** 本包根目录（= 插件安装目录），用来告诉面板「清理命令」该指向哪个包装脚本。 */
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -272,26 +268,34 @@ function armHelper(reason) {
   }
 }
 
-/** 只读扫描（绝不写盘）。 */
+/**
+ * 数一下有多少个会话目录 —— **只看目录名，不解压任何日志**（1.3.9）。
+ * 面板不再需要「哪个会话有几条子代理条目」：那要逐帧解压几十 MB 的 zstd 日志，一期要好几秒，
+ * 而这些明细对「该不该清理」没有帮助。要明细就跑 CLI 的 `list`（它才解压，而且带增量缓存）。
+ */
+function countSessionDirs() {
+  let count = 0
+  let workspaces = []
+  try {
+    workspaces = readdirSync(SESS_ROOT, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  for (const ws of workspaces) {
+    if (!ws.isDirectory()) continue
+    try {
+      for (const entry of readdirSync(join(SESS_ROOT, ws.name), { withFileTypes: true })) {
+        if (entry.isDirectory()) count++
+      }
+    } catch {
+      // 某个工作区目录读不了就跳过它，不要因此让整个面板读不出来。
+    }
+  }
+  return count
+}
+
+/** 只读扫描（绝不写盘，也**不解压任何会话日志**）。 */
 export function scan() {
-  const sessions = listSessions(undefined).map((s) => ({
-    sessionId: s.sessionId,
-    workspace: s.projectLabel,
-    dir: s.dir,
-    log: s.logName,
-    generation: s.generation,
-    size: s.size,
-    mtime: s.mtime instanceof Date ? s.mtime.toISOString() : String(s.mtime),
-    frames: s.frames,
-    rows: s.rows,
-    catalog: s.catalog,
-    broken: s.broken || '',
-    cacheTitle: typeof s.cache?.title === 'string' ? s.cache.title : '',
-    cacheCatalogCount: s.cache?.catalogCount ?? null,
-    inherited: s.cache?.inherited ?? 0,
-    cachePath: s.cachePath || '',
-  }))
-  sessions.sort((a, b) => (a.mtime < b.mtime ? 1 : -1))
   return {
     version: VERSION,
     dshHome: DSH_HOME,
@@ -302,10 +306,7 @@ export function scan() {
     scriptPath: join(PKG_ROOT, 'clean.mjs'),
     backupRoot: join(PKG_ROOT, 'backups'),
     scannedAt: new Date().toISOString(),
-    total: sessions.length,
-    withEntries: sessions.filter((s) => (s.catalog ?? 0) > 0).length,
-    truncated: sessions.length > MAX_SESSIONS,
-    sessions: sessions.slice(0, MAX_SESSIONS),
+    total: countSessionDirs(),
     auto: autoState(),
   }
 }
