@@ -308,7 +308,7 @@ function registerWithLoader() {
         value
           ? h('div', null,
             h('div', { style: { ...S.muted, marginTop: '6px' } },
-              `v${value.version} · DSH_HOME=${value.dshHome} · 扫描于 ${value.scannedAt}`,
+              `v${value.version} · DSH_HOME=${value.dshHome} · 读取于 ${ageText(value.scannedAt) || value.scannedAt}`,
             ),
             h('div', { style: { marginTop: '8px' } },
               `会话目录 ${value.total} 个　·　本页只读目录名，不解压任何会话日志`
