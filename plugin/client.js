@@ -401,7 +401,7 @@ function registerWithLoader() {
               h('div', { style: { ...S.muted, marginTop: '3px' } },
                 `每个父会话、子代理各占一份 <会话id>.json，`
                 + '删掉不会改到会话内容，重启会自动重建。'),
-              h('div', { style: { marginTop: '3px', color: '#11ccee' } },
+              h('div', { style: { marginTop: '3px', color: '#1188ee' } },
                 '只想「清掉子代理、保留父会话」？删掉这两个目录下所有不以 session 开头的文件即可。'),
             ),
 

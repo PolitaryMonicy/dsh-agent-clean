@@ -1,0 +1,22 @@
+若要对"会话清理诊断"中的说明文本做手动调整，要修改的地方只有一个文件：
+C:\Users\Administrator\Documents\GitHub\dsh-subagent-clean\plugin\client.js
+你的 profile 通过 link: 直接指向这个仓库，因此改完不需要复制到别处，下次加载就是新文本。
+
+面板文本的位置：
+行	内容
+292	标题 dsh-agent-clean · 会话清理诊断
+301	标题下面的第一行说明
+314	概览行「会话目录 N 个　·　本页只读目录名，不解压任何会话日志」
+329	开关名「每次退出 DSH 时自动移除无用子代理条目」
+333–343	开关下面的两行小字，以及开关状态
+347	「想让自动清理真的跑一次：…」那一整段
+353–359	自动清理的报告行（实际文字由 describeAuto() 生成，见下）
+391	「如何锁定或删改本地会话日志？」整块（你要微调的主要是这里）
+414	「这个面板不会在 DSH 运行中改动会话存储。」整块
+428	命令行的提示「非破坏：保留全部行与 seq…」
+另外，describeAuto()（约 208–231 行）生成那些会随状态变化的句子，例如「上次自动清理：…处理 N 个会话」「上次未执行：…」。如果你想改这类句子，包括 why 代码对应的中文解释，就要改这里。
+
+改动时的三个注意事项
+只修改引号或反引号里的字，不要改动 ${value.sessionsRoot} 这类插值、括号配对和拼接结构。
+保持编码为 UTF-8 无 BOM、固定使用 LF（用 VS Code 最省事；不要用 PowerShell 的 Set-Content -Encoding utf8，它会加 BOM）。
+保存后验证：运行 node --check plugin\client.js；如果想更稳妥，再运行 node test\client-slot-probe.mjs，它应当输出 A=PASS B=PASS C=PASS。
