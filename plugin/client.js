@@ -311,8 +311,8 @@ function registerWithLoader() {
               `v${value.version} · DSH_HOME=${value.dshHome} · 读取于 ${ageText(value.scannedAt) || value.scannedAt}`,
             ),
             h('div', { style: { marginTop: '8px' } },
-              `会话目录 ${value.total} 个　·　本页只读目录名，不解压任何会话日志`
-              + '（要逐会话明细就跑下面的 list，它才解压，而且带增量缓存）',
+              `会话目录 ${value.total} 个　·　本页只读目录名，不解压会话日志`
+              + '（要逐会话列则需在终端中输入页末的命令）',
             ),
 
             h('div', { style: S.card },
@@ -331,24 +331,21 @@ function registerWithLoader() {
                 h('span', { style: S.muted }, busy ? '写入中…' : autoSaved ? '已保存' : '默认启用'),
               ),
               h('div', { style: { ...S.muted, marginTop: '4px', fontSize: '11.5px' } },
-                '打开后，DSH 每次启动都会架设一个脱离的助手进程：它等你「完全退出」DSH 之后，'
-                + '自动执行与下面那条「一键清掉所有会话的子代理条目」完全相同的管线（逐会话整份备份 → 结构自检 → 真实加载器复核）。'
-                + '所以你什么都不用敲，下次启动时界面里就已经没有条目了。',
+                '启用后，DSH 每次启动都会架设一个游离的助手进程，在你「完全退出」DSH 之后，'
+                + '自动执行任务「一键清掉所有会话的子代理条目」　·　（逐会话整份备份 → 结构自检 → 真实加载器复核）',
               ),
               h('div', { style: { ...S.muted, marginTop: '3px', fontSize: '11.5px' } },
-                '若退出时还有别的 DSH 实例在跑，助手不会动手（同一份会话存储不能有两个写者），而是「继续等」，'
-                + '等到机器上真的没有 DSH 了再清理；只有等到 72 小时上限仍没等到，才会记一条「本次跳过」。'
-                + '注意 DSH 应用菜单里的「重启」是 app.relaunch() —— 新实例先起来、旧实例后退出，两者重叠一两秒，'
-                + '这种重启链里不存在「没有实例」的空档，助手会一直等到你「真正关掉」DSH 的那一刻才动手。'
-                + '一个实例本身有五六个同名进程（主进程、GPU、网络、渲染、host），工具命令的 runner 与我们自己的助手也是同一个 exe —— '
-                + '所以判定「另一个实例」时只认主进程与 host 进程。',
+                '若退出时还有别的 DSH 实例在跑，助手不会动手，而是等到设备上没有 DSH 了再清理；直到 72 小时上限仍没等到，才会记一条「本次跳过」。'
+                + '注意 DSH 应用菜单里的「重启」是 app.relaunch() —— 新 DSH 先起来、旧 DSH 后退出，两者重叠一两秒。'
+                + '一个 DSH 本身有五六个同名进程（主进程、GPU、网络、渲染、host），工具命令的 runner 与我们自己的助手也是同一个 exe —— '
+                + '所以判定「另一个 DSH」时只认主进程与 host 进程。',
               ),
               h('div', { style: { marginTop: '3px', fontSize: '11.5px', color: '#b8860b' } },
-                '想让自动清理真的跑一次：把 DSH 「完全退出」（关窗口不算 —— 它可能会问你是否退到后台），'
-                + '等一两分钟让助手做完（这段「上次自动清理」会刷新成这一次的结果），再打开。'
+                '想让自动清理完整跑一次？把 DSH「完全退出」（关窗口不算），'
+                + '等一两分钟让助手做完（清理结果同时也会刷新），再打开。'
                 + '原因是清理一个会话要几十秒，而「关掉就马上重开」两次启动之间只有一两秒空档：'
-                + '助手要连续确认几轮才敢动手，一旦发现新实例已经起来就停手，把剩下的留给下一次。'
-                + '也可以完全退出 DSH 之后，直接照下面那条命令手动跑一次。',
+                + '助手要连续确认几轮才敢动手。'
+                + '也可以完全退出 DSH 之后，到终端跑一次下面那条 dismiss 命令。',
               ),
               h('div', { style: { marginTop: '4px', fontSize: '11.5px' } }, describeAuto(auto && auto.lastAuto)),
               auto && auto.lastMissed
@@ -390,24 +387,22 @@ function registerWithLoader() {
             h('div', { style: S.note },
               h('div', { style: { fontWeight: 600 } }, '如何锁定或删改本地会话日志？'),
               h('div', { style: { ...S.muted, marginTop: '3px' } },
-                '这个助手只会把 DSH 界面上的子代理条目去掉（改的是父会话日志里那几行 catalog 事件），'
-                + '不会改动设备上的任何目录或文件。若想直接修改或删除本地会话日志，请到下面两处手动处理，'
-                + '并且先「完全退出 DSH」：'),
+                '这个助手只会把 DSH 界面上的子代理条目去掉（改的是父会话日志里那几行 catalog），'
+                + '不会改动任何本地目录。若想删改本地会话日志，建议先退出 DSH，再到下面两处手动处理：'),
+              h('div', { style: { marginTop: '3px' } },
+                `1. 会话日志：${value.sessionsRoot}`),
               h('div', { style: { ...S.muted, marginTop: '3px' } },
-                `· 会话日志：${value.sessionsRoot} 下，每个工作区对应其中一个文件夹（例如 `
-                + `${value.sessionsRoot}\\<工作区哈希>\\）；每个会话又是它下面的一个子目录 —— `
+                `该目录下的每个文件夹对应于 DSH 的一个工作区（如 `
+                + `${value.sessionsRoot}\\<工作区哈希>\\），存有该工作区内的所有会话目录 —— `
                 + '目录名以 session 开头的是父会话，不以 session 开头的一串裸 uuid 是子代理（例如 '
-                + `${value.sessionsRoot}\\<工作区哈希>\\dddd5555-5555-5555-5555-555555555555）。`),
+                + `<工作区哈希>\\dddd5555-5555-5555-5555-555555555555 就是子代理）。`),
+              h('div', { style: { marginTop: '3px' } },
+                `2. 投影缓存：${value.cacheRoot}`),
               h('div', { style: { ...S.muted, marginTop: '3px' } },
-                `· 投影缓存：${value.cacheRoot} 下，每个父会话与每个子代理各一份 <会话id>.json（记事本就能打开）；`
-                + '它只是缓存，删掉不会动到会话内容，下次运行会自动重建。'),
-              h('div', { style: { ...S.muted, marginTop: '3px' } },
-                '只想清掉子代理、保留父会话：删掉第一处里所有不以 session 开头的目录，再删掉第二处里与这些裸 uuid '
-                + '同名的 .json（也就是不以 session 开头的那些）。按「修改时间」排序最容易定位 —— 子代理的目录和'
-                + '缓存通常与它所属的父会话同时或稍晚出现。'),
-              h('div', { style: { ...S.muted, marginTop: '3px' } },
-                '（区别：删目录＝把子代理会话本身彻底删掉；下面命令里的 dismiss 只改父会话日志，让界面不再列出子代理，'
-                + '子代理目录仍留在盘上。孤儿投影缓存可以用 clean.cmd orphans --apply 单独清。）'),
+                `每个父会话、子代理各占一份 <会话id>.json，`
+                + '删掉不会改到会话内容，重启会自动重建。'),
+              h('div', { style: { marginTop: '3px', color: '#11ccee' } },
+                '只想「清掉子代理、保留父会话」？删掉这两个目录下所有不以 session 开头的文件即可。'),
             ),
 
             h('div', { style: { ...S.note, marginTop: '12px' } },
@@ -427,8 +422,7 @@ function registerWithLoader() {
                 command: `"${cli}" dismiss --all --apply`,
                 hint: '非破坏：保留全部行与 seq，只把「自己的」catalog 行改成被忽略的类型；每个会话都会先整份备份、'
                   + '并用真实加载器在镜像里自检（会话多时会慢一些）。默认试演 —— 去掉 --apply 只看计划。'
-                  + '必须在完全退出 DSH 后执行，执行完再启动 DSH。',
-              }),
+                  + '必须在完全退出 DSH 后执行，执行完再启动 DSH。'}),
               h(CommandLine, { label: '先看总览：每个会话有几条、日志多大、缓存标题（会解压日志，带增量缓存）', command: `"${cli}" list` }),
             ),
           )
