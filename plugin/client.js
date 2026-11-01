@@ -352,7 +352,7 @@ function registerWithLoader() {
                 ? (() => {
                   const m = auto.lastMissed
                   const seen = m.lastSeenAt ? `最后一次心跳 ${m.lastSeenAt}，` : ''
-                  return h('div', { style: { marginTop: '2px', fontSize: '11.5px', color: '#b8860b' } },
+                  return h('div', { style: { marginTop: '2px', fontSize: '11.5px', color: '#ee2200' } },
                     `⚠ 上一轮退出窗口里的助手没留下任何报告：为 pid ${m.waitedPid} 架设的助手`
                     + `${m.helperPid ? `（pid ${m.helperPid}）` : ''}架设于 ${m.at || '未知时间'}，${seen}现已不在`
                     + '（纯 JS 异常一定会留下 helper-crash 报告，所以没有报告多半是它被外力结束：关机、任务管理器，'
