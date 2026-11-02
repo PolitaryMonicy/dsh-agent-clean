@@ -29,19 +29,25 @@ import {
   ARM_FILE,
   AUTO_ARMED,
   AUTO_DEFAULTS,
+  BACKUP_ROOT,
   CACHE_ROOT,
   DSH_HOME,
+  PRUNE_FILE,
   SESS_ROOT,
   VERSION,
   missedRun,
   pidAlive,
+  pruneBackups,
+  pruneState,
   readArm,
   readArmed,
   readAutoReport,
   readAutoLogTail,
   readHeartbeat,
+  readPrune,
   writeArm,
   writeArmed,
+  writePrune,
 } from '../clean.mjs'
 
 /** cordis 插件名（`cordis.patch.yml` 里写的 `name` 是**包名**，两者可以不同）。 */
@@ -304,10 +310,11 @@ export function scan() {
     platform: process.platform,
     cliPath: join(PKG_ROOT, process.platform === 'win32' ? 'clean.cmd' : 'clean.sh'),
     scriptPath: join(PKG_ROOT, 'clean.mjs'),
-    backupRoot: join(PKG_ROOT, 'backups'),
+    backupRoot: BACKUP_ROOT,
     scannedAt: new Date().toISOString(),
     total: countSessionDirs(),
     auto: autoState(),
+    prune: pruneState(),
   }
 }
 
@@ -360,20 +367,49 @@ export function apply(ctx) {
           return
         }
         const patch = {}
+        const prunePatch = {}
         if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
         if (typeof body.verify === 'boolean') patch.verify = body.verify
         if (Number.isFinite(Number(body.maxWaitMs)) && Number(body.maxWaitMs) > 0) patch.maxWaitMs = Number(body.maxWaitMs)
-        if (Object.keys(patch).length === 0) {
+        if (typeof body.pruneEnabled === 'boolean') prunePatch.enabled = body.pruneEnabled
+        if (body.pruneDays !== undefined && Number.isFinite(Number(body.pruneDays))) prunePatch.days = Number(body.pruneDays)
+        const pruneNow = body.pruneNow === true
+        if (Object.keys(patch).length === 0 && Object.keys(prunePatch).length === 0 && !pruneNow) {
           sendJson(res, 400, {
             ok: false,
-            error: { code: 'no-known-field', message: '没有可写的字段（只接受 enabled / verify / maxWaitMs）。' },
+            error: {
+              code: 'no-known-field',
+              message: '没有可写的字段（只接受 enabled / verify / maxWaitMs / pruneEnabled / pruneDays / pruneNow）。',
+            },
           })
           return
         }
-        const next = writeArm(patch)
-        // 打开时立刻为**本次**启动架设助手；关掉时什么都不用做（已在等待的助手会自己读到关闭状态）。
-        const armed = next.enabled === true ? armHelper('settings update') : false
-        sendJson(res, 200, { ok: true, value: { ...autoState(), armed: helperArmed, justArmed: armed } })
+        let armed = helperArmed
+        let justArmed = false
+        if (Object.keys(patch).length > 0) {
+          const next = writeArm(patch)
+          // 打开时立刻为**本次**启动架设助手；关掉时什么都不用做（已在等待的助手会自己读到关闭状态）。
+          // justArmed 只报「这一次调用有没有新架一个」，重复架设时必须为 false（探针会查）。
+          justArmed = next.enabled === true ? armHelper('settings update') : false
+          armed = helperArmed
+        }
+        const pruneSettings = Object.keys(prunePatch).length > 0 ? writePrune(prunePatch) : readPrune()
+        // 「现在清一次」：按当前设置立刻真删，结果随响应回给面板（面板不必再猜）。
+        let justPruned = null
+        if (pruneNow) {
+          const r = pruneBackups({ days: pruneSettings.days, apply: true })
+          justPruned = {
+            at: r.at,
+            days: r.days,
+            removedCount: r.removedCount,
+            freedBytes: r.freedBytes,
+            remainingCount: r.remainingCount,
+          }
+        }
+        sendJson(res, 200, {
+          ok: true,
+          value: { ...autoState(), prune: pruneState(), armed, justArmed, justPruned },
+        })
       } catch (error) {
         sendJson(res, 500, {
           ok: false,
@@ -394,6 +430,20 @@ export function apply(ctx) {
     }
     // 开关默认启用 ⇒ 每次启动都架设一次「退出后自动清理」。
     const armed = armHelper('apply')
+    // 备份存档的自动清理（设置页可关，默认开）：启动时顺手收拾一次。
+    // 为什么放启动：手动跑 `dismiss --apply` 也会留下存档，而那些不一定赶上自动清理的收尾。
+    // 代价只是 readdir + stat（几个存档 → 几毫秒），删的是超过 N 天的旧存档。
+    try {
+      const prune = readPrune()
+      if (prune.enabled === true) {
+        const r = pruneBackups({ days: prune.days, apply: true })
+        if (r.removedCount > 0) {
+          console.info(`[dsh-agent-clean] backups: pruned ${r.removedCount} archive(s) older than ${r.days} d, freed ${Math.round(r.freedBytes / 1024 / 1024)} MB`)
+        }
+      }
+    } catch (error) {
+      trace(`backup prune failed: ${String(error)}`)
+    }
     console.info(`[dsh-agent-clean] routes ready: ${SCAN_ROUTE} + ${SETTINGS_ROUTE} (fence: ${connection === undefined ? 'same-origin fallback' : 'connection.requestRejection'}, auto-clean helper: ${armed ? 'armed' : helperArmed ? 'already armed' : 'off'})`)
   } catch (error) {
     // 绝不把异常抛回 Loader：那样整个宿主都可能被算作「entry did not activate」而且悄无声息。

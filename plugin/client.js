@@ -109,6 +109,15 @@ function registerWithLoader() {
       return String(id || '').replace(/^session-/, '').slice(0, 8)
     }
 
+    /** 字节数说成人话（备份存档体积用）。 */
+    function bytesText(bytes) {
+      const n = Number(bytes) || 0
+      if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`
+      if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
+      if (n >= 1024) return `${Math.round(n / 1024)} KB`
+      return `${n} B`
+    }
+
     function copyText(text) {
       const done = () => { try { console.info('[dsh-agent-clean] copied:', text) } catch { /* 忽略 */ } }
       try {
@@ -261,6 +270,7 @@ function registerWithLoader() {
       const [state, load] = useScan()
       const [busy, setBusy] = useState(false)
       const [note, setNote] = useState('')
+      const [pruneNote, setPruneNote] = useState('')
       useEffect(() => { load() }, [load])
       const value = state.value
       const cli = (value && value.cliPath) || 'clean.cmd'
@@ -284,6 +294,46 @@ function registerWithLoader() {
           .catch((error) => {
             setBusy(false)
             setNote('写入失败：' + String((error && error.message) || error))
+          })
+      }
+
+      const prune = (value && value.prune) || null
+      const pruneOn = prune ? prune.settings?.enabled !== false : true
+      const pruneDays = (prune && prune.settings && Number(prune.settings.days)) || 7
+      const pruneStats = (prune && prune.stats) || { count: 0, bytes: 0, expiredCount: 0, expiredBytes: 0 }
+
+      /** 写备份清理的设置（与自动清理同一个路由，只是字段不同）。 */
+      const setPrune = (patch, message) => {
+        setBusy(true)
+        setPruneNote('')
+        postSettings(patch)
+          .then(() => {
+            setBusy(false)
+            setPruneNote(message)
+            load()
+          })
+          .catch((error) => {
+            setBusy(false)
+            setPruneNote('写入失败：' + String((error && error.message) || error))
+          })
+      }
+
+      /** 「现在清理一次」：真删（不是试演），结果由宿主回在 justPruned 里。 */
+      const pruneNow = () => {
+        setBusy(true)
+        setPruneNote('')
+        postSettings({ pruneNow: true })
+          .then((res) => {
+            setBusy(false)
+            const p = res && res.justPruned
+            setPruneNote(p
+              ? `已清理：删掉 ${p.removedCount} 个存档，释放 ${bytesText(p.freedBytes)}，还剩 ${p.remainingCount} 个。`
+              : '已清理：没有超过保留天数的存档。')
+            load()
+          })
+          .catch((error) => {
+            setBusy(false)
+            setPruneNote('清理失败：' + String((error && error.message) || error))
           })
       }
 
@@ -384,6 +434,74 @@ function registerWithLoader() {
                 : null,
             ),
 
+            h('div', { style: { ...S.card, marginTop: '10px' } },
+              h('div', { style: S.row },
+                h('label', {
+                  style: { display: 'flex', alignItems: 'center', gap: '7px', cursor: busy ? 'default' : 'pointer' },
+                },
+                  h('input', {
+                    type: 'checkbox',
+                    checked: pruneOn,
+                    disabled: busy,
+                    onChange: (e) => setPrune(
+                      { pruneEnabled: e.target.checked },
+                      e.target.checked
+                        ? '已启用：以后 DSH 每次启动、每轮自动清理结束时，都会顺手丢掉过期存档。'
+                        : '已关闭：存档不再自动清理，只能用下面的 prune 命令手动清。',
+                    ),
+                  }),
+                  h('span', { style: { fontWeight: 600 } }, '自动清理备份存档'),
+                ),
+                h('label', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+                  h('span', { style: S.muted }, '保留最近'),
+                  h('select', {
+                    value: String(pruneDays),
+                    disabled: busy || !pruneOn,
+                    onChange: (e) => setPrune({ pruneDays: Number(e.target.value) }, `已设为保留最近 ${e.target.value} 天。`),
+                    style: { padding: '1px 3px' },
+                  }, [3, 7, 14, 30].map((d) => h('option', { key: d, value: String(d) }, `${d} 天`))),
+                ),
+              ),
+              h('div', { style: { ...S.muted, marginTop: '4px', fontSize: '11.5px' } },
+                `备份默认落在 ${value.backupRoot}，可用环境变量 DSAC_BACKUP_DIR 改。`),
+              h('div', { style: { ...S.muted, marginTop: '3px', fontSize: '11.5px' } },
+                '每清理一个会话都会留一份整份日志的备份（本机单份 12–27 MB），所以存档会越攒越多。'
+                + `打开后，DSH 启动时与每轮自动清理结束时各查一次，只删超过 ${pruneDays} 天的旧存档；`
+                + '「最新的那一份」永不删（总留一个回滚点），'
+                + '「自测用的真实日志 fixture」也永不删（那段存档里有 .pre-dismiss 文件），'
+                + '另外目录名写进环境变量 DSAC_KEEP_BACKUPS（逗号分隔）的同样不删。'),
+              h('div', { style: { marginTop: '4px', fontSize: '11.5px' } },
+                `现有 ${pruneStats.count} 个存档，共 ${bytesText(pruneStats.bytes)}`
+                + (pruneStats.expiredCount > 0
+                  ? `　·　超过 ${pruneDays} 天的 ${pruneStats.expiredCount} 个（约 ${bytesText(pruneStats.expiredBytes)}）`
+                  : `　·　没有超过 ${pruneDays} 天的`)),
+              prune && prune.report && prune.report.at
+                ? h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11.5px' } },
+                  `上次清理：${prune.report.at}（${ageText(prune.report.at) || '时间未知'}）`
+                  + (prune.report.removedCount > 0
+                    ? `，删了 ${prune.report.removedCount} 个，释放 ${bytesText(prune.report.freedBytes)}，剩 ${prune.report.remainingCount} 个`
+                    : `，没有过期存档（当时保留 ${prune.report.days} 天）`))
+                : h('div', { style: { ...S.muted, marginTop: '2px', fontSize: '11.5px' } }, '上次清理：还没有记录'),
+              h('div', { style: { marginTop: '5px', display: 'flex', gap: '8px', alignItems: 'center' } },
+                h('button', {
+                  style: S.btn,
+                  disabled: busy || pruneStats.expiredCount === 0,
+                  onClick: pruneNow,
+                }, busy ? '清理中…' : '现在清理一次'),
+                h('span', { style: { ...S.muted, fontSize: '11px' } },
+                  '只删超过保留天数的旧存档，同样的规则也会在 DSH 启动时自动执行。'),
+              ),
+              pruneNote
+                ? h('div', {
+                  style: {
+                    marginTop: '3px',
+                    fontSize: '11.5px',
+                    color: /失败/.test(pruneNote) ? '#d9534f' : 'GrayText',
+                  },
+                }, pruneNote)
+                : null,
+            ),
+
             h('div', { style: S.note },
               h('div', { style: { fontWeight: 600 } }, '如何锁定或删改本地会话日志？'),
               h('div', { style: { ...S.muted, marginTop: '3px' } },
@@ -415,7 +533,7 @@ function registerWithLoader() {
                 '（上面那个开关只写插件自己的 auto-arm.json，也走同一条「退出后才动手」的路。）',
               ),
               h('div', { style: { ...S.muted, marginTop: '3px' } },
-                `命令走本插件自带的 CLI：${value.cliPath}（备份默认落在 ${value.backupRoot}，可用 DSAC_BACKUP_DIR 改）。`,
+                `命令走本插件自带的 CLI：${value.cliPath}。`,
               ),
               h(CommandLine, {
                 label: '一键清掉所有会话的子代理条目',
@@ -424,6 +542,12 @@ function registerWithLoader() {
                   + '并用真实加载器在镜像里自检（会话多时会慢一些）。默认试演 —— 去掉 --apply 只看计划。'
                   + '必须在完全退出 DSH 后执行，执行完再启动 DSH。'}),
               h(CommandLine, { label: '先看总览：每个会话有几条、日志多大、缓存标题（会解压日志，带增量缓存）', command: `"${cli}" list` }),
+              h(CommandLine, {
+                label: '丢掉过期的备份存档',
+                command: `"${cli}" prune --days 7`,
+                hint: '默认只试演（列出将删的存档），加 --apply 才真删。最新的那一份与自测用的真实日志 fixture 永不删；'
+                  + `设置页那个「自动清理备份存档」开关用的也是这条规则（现在是保留 ${pruneDays} 天）。`,
+              }),
             ),
           )
           : null,

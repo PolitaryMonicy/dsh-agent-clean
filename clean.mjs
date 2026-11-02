@@ -774,6 +774,36 @@ function cmdOrphans(opts) {
   emit();
 }
 
+/** `prune`：丢掉过期的备份存档（默认只试演）。自动清理收尾时也会走同一条 `pruneBackups`。 */
+function cmdPrune(opts) {
+  const settings = readPrune();
+  const days = opts.days !== undefined ? clampDays(opts.days) : settings.days;
+  const r = pruneBackups({ days, apply: opts.apply === true });
+  say(`备份目录: ${BACKUP_ROOT}`);
+  say(`保留最近 ${days} 天；现有 ${r.scanned} 个存档，共 ${mbText(r.scannedBytes)}`);
+  const protectedNames = r.kept.filter((k) => k.why === 'fixture' || k.why === 'keep-list');
+  for (const k of protectedNames) say(`  受保护（不删）: ${k.name}${k.why === 'fixture' ? '（自测用的真实日志 fixture）' : '（DSAC_KEEP_BACKUPS）'}`);
+  const newest = r.kept.find((k) => k.why === 'newest');
+  if (newest) say(`  始终保留最新一份: ${newest.name}`);
+  if (r.removedCount === 0) {
+    say('  （没有超过该天数的存档）');
+    say('');
+    emit();
+    return;
+  }
+  const verb = opts.apply === true ? '已删除' : '[试演] 将删除';
+  for (const a of r.removed) say(`  ${verb} ${a.name}  (${a.ageDays} 天前, ${mbText(a.bytes)})`);
+  if (opts.apply === true) {
+    say(`  共删除 ${r.removedCount} 个，释放 ${mbText(r.freedBytes)}；剩 ${r.remainingCount} 个 / ${mbText(r.remainingBytes)}`);
+  } else {
+    say('');
+    say(`  [试演] 加 --apply 会删掉上面 ${r.removedCount} 个，释放 ${mbText(r.freedBytes)}。`);
+    say('  想改保留天数：--days <天>（默认 7；设置页那个开关用的也是这个值）。');
+  }
+  say('');
+  emit();
+}
+
 /** 彻底删除一个会话：整份备份后删掉会话目录（含全部 generation 日志）与它的投影缓存。 */
 function purgeOne(s, opts) {
   say(`会话 ${s.sessionId}`);
@@ -977,6 +1007,197 @@ function pidAlive(pid) {
   if (!Number.isInteger(n) || n <= 0) return false;
   try { process.kill(n, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
 }
+// ---------------------------------------------------------------- 备份存档的自动清理
+/**
+ * 备份目录的副作用：`dismiss` 每跑一次就留一份**整份**会话日志（本机实测单份 12–27 MB），
+ * 自动清理又会在每次退出时跑一遍 ⇒ 存档越攒越多（实测 13 份 / 171.5 MB）。
+ * 这些存档插件运行时不读（只有 `restore` 会读你指定的那一份），所以可以按时间丢掉旧的。
+ *
+ * 三条护栏（缺一条都会出事）：
+ *  1. **自测用的真实日志 fixture 永不删**：那段存档里有 `*.pre-dismiss*` 文件（手工拼的），
+ *     删了 `selftest --fixture …` 就退化（68/68 → 65/65）；
+ *  2. **最新的那一份永不删**：无论多旧，至少留一个回滚点（用户手动清过之后也不会全空）；
+ *  3. 目录名在 `DSAC_KEEP_BACKUPS`（逗号分隔）里的也不删 —— 留一个逃生口。
+ */
+const PRUNE_FILE = join(STATE_DIR, 'backup-prune.json');
+const PRUNE_REPORT = join(STATE_DIR, 'prune-report.json');
+const PRUNE_DEFAULTS = { enabled: true, days: 7 };
+
+function readPrune() {
+  try {
+    const raw = readFileSync(PRUNE_FILE, 'utf8').replace(/^\uFEFF/, '');
+    const j = JSON.parse(raw);
+    const merged = { ...PRUNE_DEFAULTS, ...(j && typeof j === 'object' && !Array.isArray(j) ? j : {}) };
+    merged.enabled = merged.enabled !== false;
+    merged.days = clampDays(merged.days);
+    return merged;
+  } catch { return { ...PRUNE_DEFAULTS }; }
+}
+/** 天数只接受 1–3650；写坏了就退回默认，绝不因为一个数字让整轮清理停摆。 */
+function clampDays(value) {
+  const n = Math.round(Number(value));
+  return Number.isFinite(n) && n >= 1 && n <= 3650 ? n : PRUNE_DEFAULTS.days;
+}
+function writePrune(patch) {
+  const next = { ...readPrune(), ...patch, updatedAt: new Date().toISOString() };
+  next.enabled = next.enabled !== false;
+  next.days = clampDays(next.days);
+  try {
+    mkdirSync(dirname(PRUNE_FILE), { recursive: true });
+    atomicWrite(PRUNE_FILE, JSON.stringify(next, null, 2) + '\n', 'utf8');
+  } catch { /* 盘不可写：保持内存里的值，不抛 */ }
+  return next;
+}
+function readPruneReport() {
+  try {
+    const raw = readFileSync(PRUNE_REPORT, 'utf8').replace(/^\uFEFF/, '');
+    const j = JSON.parse(raw);
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : null;
+  } catch { return null; }
+}
+function writePruneReport(report) {
+  try {
+    mkdirSync(dirname(PRUNE_REPORT), { recursive: true });
+    atomicWrite(PRUNE_REPORT, JSON.stringify(report, null, 2) + '\n', 'utf8');
+  } catch { /* 忽略 */ }
+}
+/** 存档的「年龄」以**目录名里的时间戳**为准（拷来拷去不改名也不会变），解析不了才退回 mtime。 */
+function archiveCreatedAt(name, st) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/.exec(String(name));
+  if (m) {
+    const t = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.${m[7]}Z`);
+    if (Number.isFinite(t)) return t;
+  }
+  return st && Number.isFinite(st.mtimeMs) ? st.mtimeMs : 0;
+}
+/**
+ * 列出备份目录里的每一个存档（只 stat，不读内容）。
+ * `protected` 的判定：目录里任意层级有名字含 `.pre-dismiss` 的文件，或目录名在 DSAC_KEEP_BACKUPS 里。
+ */
+function scanBackups() {
+  let entries = [];
+  try { entries = readdirSync(BACKUP_ROOT, { withFileTypes: true }); } catch { return []; }
+  const keepList = String(process.env.DSAC_KEEP_BACKUPS ?? '').split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+  const list = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(BACKUP_ROOT, entry.name);
+    let st = null;
+    try { st = statSync(dir); } catch { continue; }
+    let bytes = 0;
+    let fixture = false;
+    const walk = (d) => {
+      let inner = [];
+      try { inner = readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const f of inner) {
+        const p = join(d, f.name);
+        if (f.isDirectory()) { walk(p); continue; }
+        try { bytes += statSync(p).size; } catch { /* 单个文件读不到不影响别的 */ }
+        if (f.name.includes('.pre-dismiss')) fixture = true;
+      }
+    };
+    walk(dir);
+    const inKeepList = keepList.includes(entry.name);
+    list.push({
+      name: entry.name, dir, bytes, createdAt: archiveCreatedAt(entry.name, st),
+      protected: fixture || inKeepList,
+      reason: fixture ? 'fixture' : inKeepList ? 'keep-list' : null,
+    });
+  }
+  list.sort((a, b) => b.createdAt - a.createdAt);
+  return list;
+}
+/**
+ * 丢掉超过 `days` 天的存档。`apply: false`（默认）只算不改，返回同一份结构。
+ * 返回 `{at, days, apply, scanned, scannedBytes, removed[], removedCount, freedBytes, remainingCount, remainingBytes, kept[]}`。
+ */
+function pruneBackups(opts = {}) {
+  const days = clampDays(opts.days ?? readPrune().days);
+  const apply = opts.apply === true;
+  const keepNewest = opts.keepNewest !== false;
+  const all = scanBackups();
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const removed = [];
+  const kept = [];
+  let newestMarked = false;
+  for (const a of all) {
+    const keep = (why) => kept.push({ name: a.name, bytes: a.bytes, ageDays: Math.floor((Date.now() - a.createdAt) / 86400000), why });
+    if (a.protected) { keep(a.reason || 'protected'); continue; }
+    if (keepNewest && !newestMarked) { newestMarked = true; keep('newest'); continue; }
+    if (a.createdAt >= cutoff) { keep('recent'); continue; }
+    if (!apply) { removed.push({ name: a.name, bytes: a.bytes, ageDays: Math.floor((Date.now() - a.createdAt) / 86400000) }); continue; }
+    try {
+      rmSync(a.dir, { recursive: true, force: true });
+      removed.push({ name: a.name, bytes: a.bytes, ageDays: Math.floor((Date.now() - a.createdAt) / 86400000) });
+    } catch (error) {
+      kept.push({ name: a.name, bytes: a.bytes, ageDays: Math.floor((Date.now() - a.createdAt) / 86400000), why: `delete-failed: ${String((error && error.message) || error).split('\n')[0]}` });
+    }
+  }
+  const freedBytes = removed.reduce((n, a) => n + a.bytes, 0);
+  const scannedBytes = all.reduce((n, a) => n + a.bytes, 0);
+  const report = {
+    at: new Date().toISOString(), days, apply,
+    scanned: all.length, scannedBytes,
+    removed, removedCount: removed.length, freedBytes,
+    remainingCount: apply ? all.length - removed.length : all.length,
+    remainingBytes: apply ? scannedBytes - freedBytes : scannedBytes,
+    kept,
+  };
+  if (apply && (removed.length > 0 || opts.recordEmpty !== false)) writePruneReport(report);
+  return report;
+}
+/** 给设置页的只读快照（同样只 stat，不解压任何东西）。 */
+function pruneState() {
+  const settings = readPrune();
+  const all = scanBackups();
+  const cutoff = Date.now() - settings.days * 24 * 60 * 60 * 1000;
+  // 「最新一份」与受保护的都不该被算进「将被清掉」——面板上的数字要能对上实际行为。
+  const prunable = all.filter((a) => !a.protected).slice(1);
+  return {
+    settings,
+    file: PRUNE_FILE,
+    root: BACKUP_ROOT,
+    report: readPruneReport(),
+    stats: {
+      count: all.length,
+      bytes: all.reduce((n, a) => n + a.bytes, 0),
+      protectedCount: all.filter((a) => a.protected).length,
+      expiredCount: prunable.filter((a) => a.createdAt < cutoff).length,
+      expiredBytes: prunable.filter((a) => a.createdAt < cutoff).reduce((n, a) => n + a.bytes, 0),
+      oldest: all.length ? all[all.length - 1].createdAt : null,
+      newest: all.length ? all[0].createdAt : null,
+    },
+  };
+}
+/** 人类可读的大小（CLI 的 prune 输出用；面板自己有 bytesText）。 */
+function mbText(bytes) {
+  const n = Number(bytes) || 0;
+  if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+/**
+ * 自动清理收尾时顺手收拾备份目录（开关在设置页，默认开）。
+ * 放在「报告写完」之后：万一 prune 自己炸了，也不能把已经记下的清理结果弄丢。
+ */
+function pruneAfterRun(where) {
+  try {
+    const settings = readPrune();
+    if (settings.enabled !== true) return null;
+    const r = pruneBackups({ days: settings.days, apply: true });
+    if (r.removedCount > 0) {
+      autoLog(`备份清理：丢掉 ${r.removedCount} 个超过 ${r.days} 天的存档，释放 ${Math.round(r.freedBytes / 1024 / 1024)} MB（剩 ${r.remainingCount} 个）`);
+    } else {
+      autoLog(`备份清理：没有超过 ${r.days} 天的存档（现有 ${r.remainingCount} 个，受保护 ${r.kept.filter((k) => k.why === 'fixture' || k.why === 'keep-list').length} 个）`);
+    }
+    return r;
+  } catch (error) {
+    autoLog(`备份清理：失败 —— ${String((error && error.message) || error).split('\n')[0]}（${where}）`);
+    return null;
+  }
+}
+
 /** 同步小睡（助手进程不需要事件循环）。 */
 function sleepSync(ms) {
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
@@ -1330,6 +1551,7 @@ function cmdAutoWaitInner(opts) {
     say('自动清理：没有需要处理的会话。');
     writeAutoReport({ at: startedAt.toISOString(), ran: true, pid, sessions: 0, cleaned: 0, failures: 0, results: [], durationMs: Date.now() - t0 });
     autoLog('自动清理：没有需要处理的会话');
+    pruneAfterRun('no-targets');
     emit();
     releaseLock();
     return;
@@ -1378,6 +1600,7 @@ function cmdAutoWaitInner(opts) {
     writeAutoReport(report);
     autoLog(`自动清理：中途停手 —— 本轮处理 ${results.length}／${targets.length}，改写 ${cleaned}，失败 ${failures}`);
     say(`自动清理：发现新的 DSH 实例，停手（已处理 ${results.length}／${targets.length}）。`);
+    pruneAfterRun('aborted');
     emit();
     releaseLock();
     if (failures) process.exitCode = 1;
@@ -1386,6 +1609,7 @@ function cmdAutoWaitInner(opts) {
   writeAutoReport(report);
   autoLog(`自动清理：完成，处理 ${targets.length}，改写 ${cleaned}，失败 ${failures}`);
   say(`自动清理：处理 ${targets.length} 个；改写 ${cleaned} 个；失败 ${failures} 个。备份在 ${BACKUP_ROOT}`);
+  pruneAfterRun('done');
   emit();
   releaseLock();
   if (failures) process.exitCode = 1;
@@ -1409,6 +1633,7 @@ function usage() {
   say(`  ${PROG} purge --session <id|前缀> [--apply] [--force]`);
   say('                                                   彻底删除会话目录 + 全部日志 + 投影缓存（先整份备份）');
   say(`  ${PROG} orphans [--apply]                           列出／删除「没有会话目录」的孤儿投影缓存`);
+  say(`  ${PROG} prune [--days <天>] [--apply]               丢掉过期的备份存档（默认 7 天，只试演）`);
   say(`  ${PROG} restore --backup <备份目录>                  从备份还原（dismiss／purge／orphans 的备份皆可）`);
   say(`  ${PROG} autowait --pid <DSH 的 pid>                  等该进程退出后自动执行 dismiss --all（供插件调用）`);
   say(`  ${PROG} version | help`);
@@ -1430,6 +1655,7 @@ export { frameLength, frameTexts, inspect, readCache, listSessions, allSessionId
 export { ARM_FILE, AUTO_REPORT, AUTO_LOG, AUTO_ARMED, AUTO_DEFAULTS, readArm, writeArm, readAutoReport, readArmed, writeArmed, missedRun, pidAlive, cmdAutoWait, atomicWrite, readAutoLogTail, releaseLock };
 export { dshProcessIds, otherDshPids, dshProcesses, classifyProcessCmd, otherInstances, fmtInstances, describeOthers, supersededByNewerArm };
 export { AUTO_HEARTBEAT, readHeartbeat, writeHeartbeat };
+export { PRUNE_FILE, PRUNE_REPORT, PRUNE_DEFAULTS, readPrune, writePrune, readPruneReport, pruneState, pruneBackups, pruneAfterRun, scanBackups };
 
 /** 只有被 `node clean.mjs …`（或包装脚本）直接调用时才跑 CLI；被插件 import 时只导出、不执行。 */
 const INVOKED_DIRECTLY = (() => {
@@ -1448,6 +1674,7 @@ try {
   else if (command === 'dismiss') cmdDismiss({ ...common, all: flag('--all'), session: opt('--session'), apply: flag('--apply'), force: flag('--force') });
   else if (command === 'purge') cmdPurge({ ...common, all: flag('--all'), session: opt('--session'), apply: flag('--apply'), force: flag('--force') });
   else if (command === 'orphans') cmdOrphans({ apply: flag('--apply') });
+  else if (command === 'prune') cmdPrune({ days: opt('--days'), apply: flag('--apply') });
   else if (command === 'strip') cmdStrip({ all: flag('--all'), session: opt('--session'), apply: flag('--apply'), force: flag('--force'), generations: opt('--generations') ?? 'newest' });
   else if (command === 'restore') cmdRestore(opt('--backup'));
   else if (command === 'autowait') cmdAutoWait({ pid: opt('--pid'), app: opt('--app'), asar: opt('--asar'), modules: opt('--modules'), noApp: flag('--no-app') });

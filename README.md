@@ -106,6 +106,14 @@ file still under `storages/session_projcache/sessions/`) only fed a list of litt
 visibly slowed the page down; they cost cache space only, not what you see in the UI. Run
 `clean.cmd orphans --apply` when you do want them gone (the CLI still supports it).
 
+**Automatic backup pruning** is another switch on the same page (on by default, keep 3/7/14/30 days): every cleaned
+session leaves a full log backup under `backups/` (12–27 MB each here), so the folder grows to gigabytes over time.
+While it is on, each DSH boot and the end of every auto-clean run drops archives older than the keep-window — but
+**the newest one is never deleted** (it is the only rollback point for the latest change), **the real-log fixture used
+by the test suite is never deleted** (that archive contains a `.pre-dismiss` file), and neither is anything named in
+`DSAC_KEEP_BACKUPS`. The page shows "N archives, X MB · K older than N days" plus a *clean now* button; the CLI side
+is `clean.mjs prune --days 7` (dry-run unless you add `--apply`).
+
 If the page reports `宿主返回 HTTP 404`, the host half did not load — check
 `dsh --profile desktop --dump-config` for the entry and `%TEMP%\dsh-agent-clean-host.log` for the reason.
 
@@ -156,6 +164,7 @@ Prefer to do it yourself? Turn the switch off and use the commands in the page �
 | `dismiss --all [--workspace <substr>] [--apply]` | Same, for several sessions |
 | `purge --session <id\|prefix> [--apply]` | **Delete** the session directory + all generation logs + projection cache (full backup first) |
 | `orphans [--apply]` | List/delete projection caches whose session directory is gone |
+| `prune [--days <n>] [--apply]` | Drop archives under `backups/` older than n days (default 7); the newest, the test fixture and anything in `DSAC_KEEP_BACKUPS` are never deleted |
 | `restore --backup <dir>` | Restore from a backup (works for dismiss / purge / orphans backups) |
 | `autowait --pid <DSH pid>` | Wait for that DSH process to exit, then dismiss every session that has subagent entries (what the plugin's switch arms at boot; obeys `auto-arm.json`) |
 | `version` / `help` | Version / help |
@@ -259,6 +268,14 @@ Two more constraints (handled by the tool):
   names, so it is ready as soon as it opens, and where the per-session list used to sit it explains
   "how to find and edit local session logs?" (`$DSH_HOME/sessions/<workspace-hash>/`, `session…` = a parent session,
   bare uuid = a subagent; the cache path; and the "delete only the two things that do not start with `session`" recipe).
+- **Backup pruning keeps three guard rails** (1.5.0): each archive under `backups/` is a rollback point, but every
+  cleaned session adds one (12–27 MB here), so the folder grows to gigabytes. With the switch on (default, 3/7/14/30
+  days), each DSH boot and the end of every auto-clean run calls `prune`: **the newest archive is never deleted** (it
+  is the only rollback point for the latest change), **any archive containing a `.pre-dismiss` file is never deleted**
+  (that is the real-log fixture of the test suite — losing it turns 79/79 into 76/76), and neither is anything listed
+  in `DSAC_KEEP_BACKUPS`. Age comes from the **timestamp in the directory name** (copying an archive around cannot
+  skew it) and falls back to mtime; deletion is a whole-directory `rmSync` where a single failure only records
+  `delete-failed`; the outcome goes to `prune-report.json`. `prune --days 7` on the CLI is a dry run by default.
 - **Forked sessions**: the first part of such a log is the parent's **inherited region**
   (`identity.inheritedEventCount`) and may contain the parent's own `subagent/catalog` rows. Those rows do not belong
   to this session: they are kept **byte-for-byte**, and the self-check must **not** count them as "remaining
@@ -268,7 +285,7 @@ Two more constraints (handled by the tool):
 
 ## 6. How correctness is proven
 
-- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **65/65 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners and must not call the current instance's own main process "another instance", a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, the rule that a heartbeat is only trusted when it belongs to that very helper, the restart-chain hand-over rule: an older helper yields **only** while the newer helper is alive, and stays as a fallback once it is gone, write atomicity: bytes land verbatim, no temp file survives, and a dismiss leaves no leftovers in the session directory, lock release: your own lock is deleted while someone else's is never touched, and the three scan-cache paths: an appended frame only decompresses the tail, a rewritten file — even a larger one — must be re-parsed in full, and a shrunk file leaves no stale count behind); **68/68 pass** with a real-log fixture (section below).
+- **Bundled regression suite** (never touches real data): `node test/selftest.mjs` → **76/76 pass** (fake `DSH_HOME`; covers list, orphans, purge+restore, the dismiss safety gate, offline transform, restore rollback, the auto-clean "is another DSH instance running?" check that must **not** match the helper itself nor the GPU/renderer children and tool runners and must not call the current instance's own main process "another instance", a **forked session** whose inherited catalog rows must survive byte-for-byte while its own rows are dismissed and the cache is rewritten with the fence, the "a helper that never finished must not stay silent" check, the rule that a heartbeat is only trusted when it belongs to that very helper, the restart-chain hand-over rule: an older helper yields **only** while the newer helper is alive, and stays as a fallback once it is gone, write atomicity: bytes land verbatim, no temp file survives, and a dismiss leaves no leftovers in the session directory, lock release: your own lock is deleted while someone else's is never touched, the three scan-cache paths: an appended frame only decompresses the tail, a rewritten file — even a larger one — must be re-parsed in full, and a shrunk file leaves no stale count behind, and backup pruning: a dry run touches nothing, only expired archives go, the fixture and `DSAC_KEEP_BACKUPS` are untouched, **the newest survives**, a nonsense day count falls back to 7, a second run is idempotent, and a disabled switch writes no log line); **79/79 pass** with a real-log fixture (section below).
 - **Offline probes** for the two plugin halves (no DSH, no writes to session storage):
   - `npm run probe:client` → `VERDICT A=PASS B=PASS C=PASS` — fakes `window.__ModuleLoader__` and a minimal React
     to prove the settings slot is registered exactly once, that a late `slots` service is still picked up through

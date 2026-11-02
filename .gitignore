@@ -11,6 +11,9 @@ auto-armed.json
 auto-heartbeat.json
 # 扫描缓存（每个日志解析到第几个字节 + 前缀 sha256）：纯加速用的本机状态，不入库
 scan-cache.json
+# 备份存档清理的设置与上次结果：同样是本机运行态
+backup-prune.json
+prune-report.json
 
 # 依赖与系统垃圾
 node_modules/

@@ -20,6 +20,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PKG_ROOT = join(HERE, '..')
 const ARM_FILE = join(PKG_ROOT, 'auto-arm.json')
+const PRUNE_FILE = join(PKG_ROOT, 'backup-prune.json')
+/** 备份清理在这条探针里指向一个空目录：apply() 启动时那一次 prune 是真删，不能让它碰仓库里的 backups。 */
+const FAKE_BACKUPS = join(process.env.TEMP || process.env.TMP || PKG_ROOT, `dsac-probe-backups-${process.pid}`)
 const OUT_FILE = join(process.env.TEMP || process.env.TMP || PKG_ROOT, 'dsh-agent-clean-host-probe.txt')
 
 const lines = []
@@ -35,10 +38,15 @@ function check(name, ok, detail = '') {
 /** 备份真实状态文件（探针结束还原），避免把用户的开关设成测试值。 */
 const hadArm = existsSync(ARM_FILE)
 const armBackup = hadArm ? readFileSync(ARM_FILE) : null
+const hadPrune = existsSync(PRUNE_FILE)
+const pruneBackup = hadPrune ? readFileSync(PRUNE_FILE) : null
 function restore() {
   try {
     if (hadArm) writeFileSync(ARM_FILE, armBackup)
     else if (existsSync(ARM_FILE)) rmSync(ARM_FILE)
+    if (hadPrune) writeFileSync(PRUNE_FILE, pruneBackup)
+    else if (existsSync(PRUNE_FILE)) rmSync(PRUNE_FILE)
+    rmSync(FAKE_BACKUPS, { recursive: true, force: true })
   } catch { /* 忽略 */ }
 }
 
@@ -91,6 +99,9 @@ async function main() {
   mkdirSync(dirname(ARM_FILE), { recursive: true })
   writeFileSync(ARM_FILE, JSON.stringify({ enabled: true, verify: true }, null, 2) + '\n', 'utf8')
   process.env.DSAC_ARM_DRYRUN = '1'
+  // BACKUP_ROOT 在 import 时就定下来了，所以必须在此之前把备份清理指到空目录（见 FAKE_BACKUPS）。
+  mkdirSync(FAKE_BACKUPS, { recursive: true })
+  process.env.DSAC_BACKUP_DIR = FAKE_BACKUPS
 
   const routes = []
   const ctx = {
@@ -127,6 +138,11 @@ async function main() {
   // 1.3.8：孤儿投影缓存不再进扫描结果 —— 逐条读它们的缓存文件只为了让面板列一张没人看的清单，
   // 而条目多时（一台机器 38 个）会把打开设置拖慢。CLI 的 `orphans` 仍然管这件事。
   check('scan 不再加载孤儿投影缓存（payload 里没有 orphanCaches）', !('orphanCaches' in v), Object.keys(v).join(','))
+  // 1.5.0：备份存档的清理开关与统计也要进 payload（面板要显示「现有 N 个、过期 K 个」）。
+  check('scan 带备份清理开关与统计',
+    typeof v.prune?.settings?.enabled === 'boolean' && Number.isInteger(v.prune?.stats?.count),
+    JSON.stringify({ settings: v.prune?.settings ?? null, count: v.prune?.stats?.count ?? null }))
+  check('scan 的 backupRoot 认 DSAC_BACKUP_DIR', v.backupRoot === FAKE_BACKUPS, v.backupRoot)
   check('auto.lastAuto 允许为 null', v.auto?.lastAuto === null || typeof v.auto?.lastAuto === 'object')
   check('auto 带「上一轮有没有跑完」的判定位', 'lastMissed' in (v.auto ?? {}), JSON.stringify(v.auto?.lastMissed ?? null))
   check('auto 带助手记录文件路径', typeof v.auto?.armedFile === 'string' && v.auto.armedFile.endsWith('auto-armed.json'), v.auto?.armedFile)
@@ -167,6 +183,17 @@ async function main() {
   check('verify 与 maxWaitMs 落盘', on.json?.value?.settings?.verify === false && on.json?.value?.settings?.maxWaitMs === 60000, JSON.stringify(on.json?.value?.settings))
   check('apply 时已登记助手（DRYRUN）', on.json?.value?.armed === true)
   check('重复架设不叠进程（justArmed=false）', on.json?.value?.justArmed === false)
+
+  // 1.5.0：备份清理走同一条路由，只是字段不同 —— 两组开关不能互相踩。
+  const pr = await call(settings.handler, { method: 'POST', headers: LOOPBACK, body: '{"pruneEnabled":false,"pruneDays":3}' })
+  check('POST {pruneEnabled:false,pruneDays:3} → 200 且落盘',
+    pr.status === 200 && pr.json?.value?.prune?.settings?.enabled === false && pr.json?.value?.prune?.settings?.days === 3,
+    JSON.stringify(pr.json?.value?.prune?.settings ?? null))
+  check('只改 prune 字段时不动自动清理的开关', pr.json?.value?.settings?.enabled === true && pr.json?.value?.justArmed === false)
+  const now = await call(settings.handler, { method: 'POST', headers: LOOPBACK, body: '{"pruneNow":true}' })
+  check('POST {pruneNow:true} → 200 且回 justPruned',
+    now.status === 200 && typeof now.json?.value?.justPruned?.removedCount === 'number',
+    JSON.stringify(now.json?.value?.justPruned ?? null))
 
   const scan2 = await call(scan.handler, { method: 'GET', headers: LOOPBACK })
   check('再次 scan 反映新开关', scan2.json?.value?.auto?.settings?.verify === false)

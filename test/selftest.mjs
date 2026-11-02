@@ -462,6 +462,104 @@ check('日志尾巴只取最后 3 行、默认 8 行',
   check('扫描缓存：变小后也不残留旧计数（不再列出）', countOfP() === -1, String(countOfP()));
 }
 
+// ---- 6j. 备份存档的过期清理（prune） ----------------------------------------
+// 每清一个会话就留一份整份日志的备份（本机单份 12–27 MB），不收拾会攒到几个 GB；
+// 但「最新一份」永远是回滚点、「自测用的真实日志 fixture」是 68/68 的素材，两者都不能删。
+{
+  console.log('\n6j) prune（备份存档的老旧清理）');
+  const mkArchive = (name, files) => {
+    for (const [rel, text] of Object.entries(files)) {
+      const p = path.join(BACKUPS, name, rel);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, text);
+    }
+  };
+  const oldPName = '2026-01-01T00-00-00-000Z_dismiss_oldp';
+  const oldQName = '2026-01-02T00-00-00-000Z_dismiss_oldq';
+  const fxName = '2026-01-03T00-00-00-000Z_dismiss_fixture';
+  const keepName = '2026-01-04T00-00-00-000Z_dismiss_keepme';
+  mkArchive(oldPName, { 'manifest.json': '{"a":1}\n', 'session.v4.jsonl.zstd': 'x'.repeat(1024) });
+  mkArchive(oldQName, { 'manifest.json': '{"a":2}\n', 'session.v4.jsonl.zstd': 'y'.repeat(2048) });
+  mkArchive(fxName, { 'session-bbbb2222/session.v4.pre-dismiss.jsonl.zstd': 'z' });
+  mkArchive(keepName, { 'manifest.json': '{"a":3}\n' });
+  const oldP = path.join(BACKUPS, oldPName);
+  const oldQ = path.join(BACKUPS, oldQName);
+  const fx = path.join(BACKUPS, fxName);
+  const keepMe = path.join(BACKUPS, keepName);
+  const keepEnv = { DSAC_KEEP_BACKUPS: keepName };
+  // 前面几节自己也留了备份（今天的，未过期），所以「最新一份」由它们占着 —— 这里只钉住两件事：
+  // 该删的过期存档被列出/删掉，受保护的两个（fixture、keep list）一根汗毛都不动。
+  r = run(['prune', '--days', '7'], keepEnv);
+  check('prune 试演：列出两个过期存档并提示 --apply',
+    r.code === 0 && r.out.includes(oldPName) && r.out.includes(oldQName) && /\[试演\]/.test(r.out) && /--apply/.test(r.out),
+    r.out.split('\n').filter((l) => /试演|将删除/.test(l)).join(' | ').slice(0, 240));
+  check('prune 试演不动盘', fs.existsSync(oldP) && fs.existsSync(oldQ));
+  check('prune 认出受保护项（fixture 与 DSAC_KEEP_BACKUPS）',
+    new RegExp(`受保护（不删）: ${fxName}`).test(r.out) && r.out.includes(keepName),
+    r.out.split('\n').filter((l) => /受保护/.test(l)).join(' | ').slice(0, 200));
+  r = run(['prune', '--days', '7', '--apply'], keepEnv);
+  check('prune --apply 只删该删的',
+    r.code === 0 && !fs.existsSync(oldP) && !fs.existsSync(oldQ) && fs.existsSync(fx) && fs.existsSync(keepMe),
+    r.out.split('\n').filter((l) => /已删除|共删除/.test(l)).join(' | ').slice(0, 240));
+  let pruneReport = null;
+  try { pruneReport = JSON.parse(fs.readFileSync(path.join(STATE, 'prune-report.json'), 'utf8')); } catch { pruneReport = null; }
+  check('prune 把结果写进 prune-report.json',
+    Boolean(pruneReport) && pruneReport.removedCount === 2 && pruneReport.apply === true && pruneReport.days === 7,
+    JSON.stringify(pruneReport && { removedCount: pruneReport.removedCount, days: pruneReport.days, apply: pruneReport.apply }));
+  r = run(['prune', '--days', '7', '--apply'], keepEnv);
+  check('再跑一次没有可删的（幂等）', r.code === 0 && /没有超过该天数的存档/.test(r.out), String(r.out.match(/没有超过该天数.*$/m)?.[0]));
+  r = run(['prune', '--days', '0'], keepEnv);
+  check('天数非法时退回默认 7 天', /保留最近 7 天/.test(r.out), String(r.out.match(/保留最近.*$/m)?.[0]));
+
+  // 「最新一份永不删」与「自动清理的收尾顺手 prune」在干净的临时目录里单独验（不受上面已有存档干扰）。
+  const childRoot = path.join(tmp, 'prune-child');
+  const childState = path.join(tmp, 'state-child');
+  const childProbe = spawnSync(process.execPath, ['--input-type=module', '-e', `
+const m = await import(process.env.DSAC_TEST_CLEAN);
+const fs = await import('node:fs');
+const path = await import('node:path');
+const root = process.env.DSAC_BACKUP_DIR;
+const mk = (name, bytes) => { fs.mkdirSync(path.join(root, name), { recursive: true }); fs.writeFileSync(path.join(root, name, 'x.bin'), 'x'.repeat(bytes)); };
+mk('2026-01-01T00-00-00-000Z_dismiss_a', 100);
+mk('2026-02-01T00-00-00-000Z_dismiss_b', 200);
+const dry = m.pruneBackups({ days: 7, apply: false });
+const st = m.pruneState();
+m.writePrune({ enabled: false });
+const off = m.pruneAfterRun('selftest');
+m.writePrune({ enabled: true });
+const on = m.pruneAfterRun('selftest');
+let log = '';
+try { log = fs.readFileSync(path.join(process.env.DSAC_STATE_DIR, 'auto.log'), 'utf8'); } catch { log = ''; }
+process.stdout.write(JSON.stringify({
+  newest: dry.kept.filter((k) => k.why === 'newest').map((k) => k.name),
+  removed: dry.removed.map((a) => a.name),
+  expiredCount: st.stats.expiredCount,
+  protectedCount: st.stats.protectedCount,
+  offIsNull: off === null,
+  onRemoved: on ? on.removedCount : null,
+  onLeft: on ? on.remainingCount : null,
+  logLines: log.split('\\n').filter((l) => l.includes('备份清理')).length,
+}));
+`], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      DSH_HOME: HOME,
+      DSAC_STATE_DIR: childState,
+      DSAC_BACKUP_DIR: childRoot,
+      DSAC_TEST_CLEAN: pathToFileURL(CLEAN).href,
+    },
+  });
+  let cj = {};
+  try { cj = JSON.parse(String(childProbe.stdout || '').trim()); } catch { cj = {}; }
+  check('pruneBackups 保「最新一份」、只列更早的那份',
+    JSON.stringify(cj.newest) === '["2026-02-01T00-00-00-000Z_dismiss_b"]' && JSON.stringify(cj.removed) === '["2026-01-01T00-00-00-000Z_dismiss_a"]',
+    `code=${childProbe.status} out=${String(childProbe.stdout || '').trim().slice(0, 200)} err=${String(childProbe.stderr || '').trim().slice(0, 200)}`);
+  check('pruneState 的「过期几个」不把最新一份算进去', cj.expiredCount === 1 && cj.protectedCount === 0, JSON.stringify(cj));
+  check('开关关掉时自动收尾的 prune 什么都不做', cj.offIsNull === true);
+  check('开关打开时自动收尾真删并写进 auto.log', cj.onRemoved === 1 && cj.onLeft === 1 && cj.logLines === 1, JSON.stringify(cj));
+}
+
 // ---- 7. 可选：真实日志的 dismiss 回归 --------------------------------------
 if (FIXTURE) {
   console.log('\n7) 真实日志 fixture 回归');
