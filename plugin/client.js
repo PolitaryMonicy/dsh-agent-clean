@@ -511,7 +511,7 @@ function registerWithLoader() {
                 `1. 会话日志：${value.sessionsRoot}`),
               h('div', { style: { ...S.muted, marginTop: '3px' } },
                 `该目录下的每个文件夹对应于 DSH 的一个工作区（如 `
-                + `${value.sessionsRoot}\\<工作区哈希>\\），存有该工作区内的所有会话目录（可通过打开投影缓存来定位） —— `
+                + `${value.sessionsRoot}\\<工作区哈希>\\），存有该工作区内所有会话的日志（各日志与其投影缓存的 id 相同，故可通过打开投影缓存来定位） —— `
                 + '目录名以 session 开头的是父会话，不以 session 开头的一串裸 uuid 是子代理（如 '
                 + `<工作区哈希>\\dddd5555-5555-5555-5555-555555555555 就是子代理）。`),
               h('div', { style: { marginTop: '3px' } },
